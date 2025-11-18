@@ -4,7 +4,12 @@
 endpoint = "http://localhost:5002/v1"
 model = "openai/gpt-oss-120b"
 reasoning_effort = "low"
-sleep = 0.1
+sleep = 0.5
+
+# Chunking defaults
+chunk_size = 1000
+chunk_dir = "contrib"
+chunk_manifest = "data/chunks.json"
 
 # Energy / cost defaults (watts, USD/kWh)
 power_watts = 100.0

@@ -466,20 +466,92 @@ function updateAgencyChart() {
 
 async function loadData() {
   try {
-    const response = await fetch(`${DATA_URL}?t=${Date.now()}`);
-    if (!response.ok) {
-      throw new Error(`Failed to fetch data: ${response.status}`);
+    const manifest = await fetchManifest();
+    if (manifest && manifest.length > 0) {
+      await loadChunks(manifest);
+      return;
     }
-    const text = await response.text();
-    const parsed = parseJsonl(text);
-    state.raw = parsed.map(normalizeRow);
-    state.lastUpdated = new Date();
-    populateFilters(state.raw);
-    applyFilters();
+  } catch (err) {
+    console.warn("Chunk manifest unavailable, falling back to epstein_ranked.jsonl.", err);
+  }
+
+  try {
+    await loadSingleFile();
   } catch (error) {
     console.error("Failed to load data", error);
-    alert("Unable to load epstein_ranked.jsonl. Ensure the ranking script has produced output.");
+    alert(
+      "Unable to load ranked outputs. Ensure chunk files (data/chunks.json + contrib/*.jsonl) or data/epstein_ranked.jsonl exist."
+    );
   }
+}
+
+async function fetchManifest() {
+  try {
+    const response = await fetch(`${MANIFEST_URL}?t=${Date.now()}`);
+    if (!response.ok) {
+      return null;
+    }
+    const manifest = await response.json();
+    if (!Array.isArray(manifest) || manifest.length === 0) {
+      return null;
+    }
+    return manifest;
+  } catch (error) {
+    return null;
+  }
+}
+
+async function loadChunks(manifest) {
+  const rows = [];
+  for (const entry of manifest) {
+    const jsonPath = resolveChunkPath(entry?.json);
+    if (!jsonPath) continue;
+    try {
+      const response = await fetch(`${jsonPath}?t=${Date.now()}`);
+      if (!response.ok) {
+        console.warn("Failed to fetch chunk", jsonPath);
+        continue;
+      }
+      const text = await response.text();
+      rows.push(...parseJsonl(text));
+    } catch (error) {
+      console.warn("Chunk load error", jsonPath, error);
+    }
+  }
+  if (rows.length === 0) {
+    throw new Error("Chunk manifest contained no readable data.");
+  }
+  state.raw = rows.map(normalizeRow);
+  state.lastUpdated = new Date();
+  populateFilters(state.raw);
+  applyFilters();
+}
+
+async function loadSingleFile() {
+  const response = await fetch(`${DATA_URL}?t=${Date.now()}`);
+  if (!response.ok) {
+    throw new Error(`Failed to fetch data: ${response.status}`);
+  }
+  const text = await response.text();
+  const parsed = parseJsonl(text);
+  state.raw = parsed.map(normalizeRow);
+  state.lastUpdated = new Date();
+  populateFilters(state.raw);
+  applyFilters();
+}
+
+function resolveChunkPath(path) {
+  if (!path) return null;
+  if (path.startsWith("http://") || path.startsWith("https://")) {
+    return path;
+  }
+  if (path.startsWith("../")) {
+    return path;
+  }
+  if (path.startsWith("./")) {
+    return path.replace("./", "../");
+  }
+  return `../${path}`;
 }
 
 function resetFilters() {

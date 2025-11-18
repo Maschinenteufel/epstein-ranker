@@ -1,0 +1,8 @@
+[
+  {
+    "start_row": 1,
+    "end_row": 1000,
+    "csv": "contrib/epstein_ranked_00001_01000.csv",
+    "json": "contrib/epstein_ranked_00001_01000.jsonl"
+  }
+]

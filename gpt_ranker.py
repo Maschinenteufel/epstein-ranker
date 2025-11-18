@@ -10,7 +10,7 @@ import re
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Set
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 try:
     import tomllib  # Python 3.11+
@@ -217,6 +217,24 @@ def parse_args() -> argparse.Namespace:
         action="append",
         default=[],
         help="Additional JSONL files containing already-processed rows to skip.",
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=1000,
+        help="If >0, rotate outputs every N source rows and store chunk files in --chunk-dir.",
+    )
+    parser.add_argument(
+        "--chunk-dir",
+        type=Path,
+        default=Path("contrib"),
+        help="Directory to store chunked outputs when --chunk-size > 0.",
+    )
+    parser.add_argument(
+        "--chunk-manifest",
+        type=Path,
+        default=Path("data") / "chunks.json",
+        help="Manifest JSON file listing generated chunks (used by the viewer).",
     )
     parser.add_argument(
         "--include-action-items",
@@ -523,6 +541,143 @@ def format_eta(start_time: float, processed: int, total: int) -> str:
     return f"(ETA {format_duration(eta_seconds)})"
 
 
+class OutputRouter:
+    def __init__(self, args: argparse.Namespace, fieldnames: List[str]):
+        self.args = args
+        self.fieldnames = fieldnames
+        self.chunk_size = max(0, args.chunk_size)
+        self.mode = "chunk" if self.chunk_size > 0 else "single"
+        self.include_action_items = args.include_action_items
+        self.csv_handle = None
+        self.json_handle = None
+        self.csv_writer = None
+        self.current_chunk: Optional[Tuple[int, int]] = None
+        self.current_paths: Optional[Tuple[Path, Path]] = None
+        if self.mode == "single":
+            self._init_single()
+        else:
+            self._init_chunk()
+
+    def _init_single(self) -> None:
+        csv_mode = "a" if self.args.resume and self.args.output.exists() else "w"
+        self.args.output.parent.mkdir(parents=True, exist_ok=True)
+        self.csv_handle = self.args.output.open(csv_mode, newline="", encoding="utf-8")
+        self.csv_writer = csv.DictWriter(self.csv_handle, fieldnames=self.fieldnames)
+        if csv_mode == "w":
+            self.csv_writer.writeheader()
+        json_mode = "a" if self.args.resume and self.args.json_output.exists() else "w"
+        self.args.json_output.parent.mkdir(parents=True, exist_ok=True)
+        self.json_handle = self.args.json_output.open(json_mode, encoding="utf-8")
+
+    def _init_chunk(self) -> None:
+        self.chunk_dir: Path = self.args.chunk_dir
+        self.chunk_dir.mkdir(parents=True, exist_ok=True)
+        self.chunk_manifest: Path = self.args.chunk_manifest
+        self.manifest_entries = self._load_manifest()
+        self.manifest_dirty = False
+
+    def _load_manifest(self) -> Dict[Tuple[int, int], Dict[str, Any]]:
+        if not self.chunk_manifest.exists():
+            return {}
+        try:
+            with self.chunk_manifest.open(encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (json.JSONDecodeError, FileNotFoundError):
+            return {}
+        entries: Dict[Tuple[int, int], Dict[str, Any]] = {}
+        for entry in data:
+            key = (entry.get("start_row"), entry.get("end_row"))
+            if not isinstance(key[0], int) or not isinstance(key[1], int):
+                continue
+            entries[key] = entry
+        return entries
+
+    def write(self, row_idx: int, csv_row: Dict[str, Any], json_record: Dict[str, Any]) -> None:
+        if self.mode == "single":
+            self.csv_writer.writerow(csv_row)
+            self.csv_handle.flush()
+            self.json_handle.write(json.dumps(json_record, ensure_ascii=False) + "\n")
+            self.json_handle.flush()
+            return
+
+        chunk_bounds = self._chunk_bounds(row_idx)
+        self._ensure_chunk(chunk_bounds)
+        self.csv_writer.writerow(csv_row)
+        self.csv_handle.flush()
+        self.json_handle.write(json.dumps(json_record, ensure_ascii=False) + "\n")
+        self.json_handle.flush()
+
+    def _chunk_bounds(self, row_idx: int) -> Tuple[int, int]:
+        chunk_start = ((row_idx - 1) // self.chunk_size) * self.chunk_size + 1
+        chunk_end = chunk_start + self.chunk_size - 1
+        if self.args.end_row is not None:
+            chunk_end = min(chunk_end, self.args.end_row)
+        return (chunk_start, chunk_end)
+
+    def _ensure_chunk(self, chunk_bounds: Tuple[int, int]) -> None:
+        if self.current_chunk == chunk_bounds:
+            return
+        self._close_chunk()
+        self.current_chunk = chunk_bounds
+        chunk_start, chunk_end = chunk_bounds
+        base = f"epstein_ranked_{chunk_start:05d}_{chunk_end:05d}"
+        csv_path = self.chunk_dir / f"{base}.csv"
+        json_path = self.chunk_dir / f"{base}.jsonl"
+        csv_exists = csv_path.exists()
+        json_exists = json_path.exists()
+        if csv_exists and not self.args.resume and not self.args.overwrite_output:
+            raise FileExistsError(
+                f"Chunk CSV {csv_path} exists. Use --resume or --overwrite-output."
+            )
+        if json_exists and not self.args.resume and not self.args.overwrite_output:
+            raise FileExistsError(
+                f"Chunk JSON {json_path} exists. Use --resume or --overwrite-output."
+            )
+        csv_mode = "a" if self.args.resume and csv_exists else "w"
+        json_mode = "a" if self.args.resume and json_exists else "w"
+        self.csv_handle = csv_path.open(csv_mode, newline="", encoding="utf-8")
+        self.csv_writer = csv.DictWriter(self.csv_handle, fieldnames=self.fieldnames)
+        if csv_mode == "w":
+            self.csv_writer.writeheader()
+        self.json_handle = json_path.open(json_mode, encoding="utf-8")
+        self.current_paths = (csv_path, json_path)
+
+    def _close_chunk(self) -> None:
+        if self.csv_handle:
+            self.csv_handle.close()
+            self.csv_handle = None
+        if self.json_handle:
+            self.json_handle.close()
+            self.json_handle = None
+        if self.current_chunk and self.current_paths:
+            chunk_start, chunk_end = self.current_chunk
+            csv_path, json_path = self.current_paths
+            entry = {
+                "start_row": chunk_start,
+                "end_row": chunk_end,
+                "csv": str(csv_path.as_posix()),
+                "json": str(json_path.as_posix()),
+            }
+            self.manifest_entries[self.current_chunk] = entry
+            self.manifest_dirty = True
+        self.current_chunk = None
+        self.current_paths = None
+        self.csv_writer = None
+
+    def close(self) -> None:
+        if self.mode == "single":
+            if self.csv_handle:
+                self.csv_handle.close()
+            if self.json_handle:
+                self.json_handle.close()
+            return
+        self._close_chunk()
+        if self.manifest_dirty:
+            entries = sorted(self.manifest_entries.values(), key=lambda e: e["start_row"])
+            self.chunk_manifest.parent.mkdir(parents=True, exist_ok=True)
+            with self.chunk_manifest.open("w", encoding="utf-8") as handle:
+                json.dump(entries, handle, indent=2)
+
 def format_cost_summary(
     power_watts: Optional[float],
     electric_rate: Optional[float],
@@ -572,24 +727,25 @@ def main() -> None:
         sys.exit("--start-row must be >= 1")
     if args.end_row is not None and args.end_row < args.start_row:
         sys.exit("--end-row must be greater than or equal to --start-row")
-    if (
-        args.output.exists()
-        and not args.resume
-        and not args.overwrite_output
-    ):
-        sys.exit(
-            f"Output file {args.output} already exists. "
-            "Use --resume to append/skip or --overwrite-output to replace."
-        )
-    if (
-        args.json_output.exists()
-        and not args.resume
-        and not args.overwrite_output
-    ):
-        sys.exit(
-            f"JSON output file {args.json_output} already exists. "
-            "Use --resume to append/skip or --overwrite-output to replace."
-        )
+    if args.chunk_size <= 0:
+        if (
+            args.output.exists()
+            and not args.resume
+            and not args.overwrite_output
+        ):
+            sys.exit(
+                f"Output file {args.output} already exists. "
+                "Use --resume to append/skip or --overwrite-output to replace."
+            )
+        if (
+            args.json_output.exists()
+            and not args.resume
+            and not args.overwrite_output
+        ):
+            sys.exit(
+                f"JSON output file {args.json_output} already exists. "
+                "Use --resume to append/skip or --overwrite-output to replace."
+            )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.json_output.parent.mkdir(parents=True, exist_ok=True)
@@ -640,131 +796,126 @@ def main() -> None:
         f"(skipping {already_done} already completed, total considered {total_candidates})."
     )
 
-    csv_mode = "a" if args.resume and args.output.exists() else "w"
-    with args.output.open(csv_mode, newline="", encoding="utf-8") as out_handle, args.json_output.open(
-        "a" if args.resume and args.json_output.exists() else "w", encoding="utf-8"
-    ) as json_handle:
-        writer = csv.DictWriter(out_handle, fieldnames=fieldnames)
-        if not (args.resume and args.output.exists()):
-            writer.writeheader()
+    output_router = OutputRouter(args, fieldnames)
+    checkpoint_handle = (
+        args.checkpoint.open("a", encoding="utf-8") if args.checkpoint else None
+    )
+    start_time = time.monotonic()
+    try:
+        for idx, row in enumerate(iter_rows(args.input), start=1):
+            if idx < args.start_row:
+                continue
+            if args.end_row is not None and idx > args.end_row:
+                break
+            if args.max_rows is not None and processed >= args.max_rows:
+                break
 
-        checkpoint_handle = (
-            args.checkpoint.open("a", encoding="utf-8") if args.checkpoint else None
-        )
+            filename = row["filename"]
+            text = row["text"]
 
-        start_time = time.monotonic()
-        try:
-            for idx, row in enumerate(iter_rows(args.input), start=1):
-                if idx < args.start_row:
-                    continue
-                if args.end_row is not None and idx > args.end_row:
-                    break
-                if args.max_rows is not None and processed >= args.max_rows:
-                    break
+            if filename in completed_filenames:
+                print(f"[skip] {filename} already processed.", flush=True)
+                continue
 
-                filename = row["filename"]
-                text = row["text"]
+            progress_prefix = (
+                f"[{processed + 1}/{target_total}]"
+                if target_total
+                else f"[{processed + 1}]"
+            )
+            eta_text = format_eta(start_time, processed, target_total)
+            print(f"{progress_prefix} Processing {filename}... {eta_text}", flush=True)
 
-                if filename in completed_filenames:
-                    print(f"[skip] {filename} already processed.", flush=True)
-                    continue
-
-                progress_prefix = (
-                    f"[{processed + 1}/{target_total}]"
-                    if target_total
-                    else f"[{processed + 1}]"
+            try:
+                result = call_model(
+                    endpoint=args.endpoint,
+                    model=args.model,
+                    filename=filename,
+                    text=text,
+                    system_prompt=args.system_prompt,
+                    api_key=args.api_key,
+                    timeout=args.timeout,
+                    reasoning_effort=args.reasoning_effort,
                 )
-                eta_text = format_eta(start_time, processed, target_total)
-                print(f"{progress_prefix} Processing {filename}... {eta_text}", flush=True)
+            except Exception as exc:  # noqa: BLE001
+                print(f"  ! Failed to analyze {filename}: {exc}", file=sys.stderr)
+                continue
 
-                try:
-                    result = call_model(
-                        endpoint=args.endpoint,
-                        model=args.model,
-                        filename=filename,
-                        text=text,
-                        system_prompt=args.system_prompt,
-                        api_key=args.api_key,
-                        timeout=args.timeout,
-                        reasoning_effort=args.reasoning_effort,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    print(f"  ! Failed to analyze {filename}: {exc}", file=sys.stderr)
-                    continue
+            key_insights = normalize_text_list(ensure_list(result.get("key_insights")))
+            tags = normalize_text_list(ensure_list(result.get("tags")))
+            power_mentions = normalize_text_list(
+                ensure_list(result.get("power_mentions")), strip_descriptor=True
+            )
+            agency_involvement = normalize_agencies(
+                normalize_text_list(ensure_list(result.get("agency_involvement")), strip_descriptor=True)
+            )
+            lead_types = normalize_lead_types(ensure_list(result.get("lead_types")))
+            action_items = (
+                normalize_text_list(ensure_list(result.get("action_items")))
+                if args.include_action_items
+                else []
+            )
 
-                key_insights = normalize_text_list(ensure_list(result.get("key_insights")))
-                tags = normalize_text_list(ensure_list(result.get("tags")))
-                power_mentions = normalize_text_list(
-                    ensure_list(result.get("power_mentions")), strip_descriptor=True
-                )
-                agency_involvement = normalize_agencies(
-                    normalize_text_list(ensure_list(result.get("agency_involvement")), strip_descriptor=True)
-                )
-                lead_types = normalize_lead_types(ensure_list(result.get("lead_types")))
-                action_items = (
-                    normalize_text_list(ensure_list(result.get("action_items")))
-                    if args.include_action_items
-                    else []
-                )
+            csv_row = {
+                "filename": filename,
+                "source_row_index": idx,
+                "headline": result.get("headline", ""),
+                "importance_score": result.get("importance_score", ""),
+                "reason": result.get("reason", ""),
+                "key_insights": "; ".join(key_insights),
+                "tags": "; ".join(tags),
+                "power_mentions": "; ".join(power_mentions),
+                "agency_involvement": "; ".join(agency_involvement),
+                "lead_types": "; ".join(lead_types),
+            }
+            if args.include_action_items:
+                csv_row["action_items"] = "; ".join(action_items)
 
-                csv_row = {
-                    "filename": filename,
+            json_record: Dict[str, Any] = {
+                "filename": filename,
+                "headline": result.get("headline", ""),
+                "importance_score": result.get("importance_score", ""),
+                "reason": result.get("reason", ""),
+                "key_insights": key_insights,
+                "tags": tags,
+                "power_mentions": power_mentions,
+                "agency_involvement": agency_involvement,
+                "lead_types": lead_types,
+                "metadata": {
                     "source_row_index": idx,
-                    "headline": result.get("headline", ""),
-                    "importance_score": result.get("importance_score", ""),
-                    "reason": result.get("reason", ""),
-                    "key_insights": "; ".join(key_insights),
-                    "tags": "; ".join(tags),
-                    "power_mentions": "; ".join(power_mentions),
-                    "agency_involvement": "; ".join(agency_involvement),
-                    "lead_types": "; ".join(lead_types),
-                }
-                if args.include_action_items:
-                    csv_row["action_items"] = "; ".join(action_items)
+                    "original_row": row,
+                },
+            }
+            if args.include_action_items:
+                json_record["action_items"] = action_items
 
-                writer.writerow(csv_row)
-                out_handle.flush()
+            output_router.write(idx, csv_row, json_record)
 
-                json_record: Dict[str, Any] = {
-                    "filename": filename,
-                    "headline": result.get("headline", ""),
-                    "importance_score": result.get("importance_score", ""),
-                    "reason": result.get("reason", ""),
-                    "key_insights": key_insights,
-                    "tags": tags,
-                    "power_mentions": power_mentions,
-                    "agency_involvement": agency_involvement,
-                    "lead_types": lead_types,
-                    "metadata": {
-                        "source_row_index": idx,
-                        "original_row": row,
-                    },
-                }
-                if args.include_action_items:
-                    json_record["action_items"] = action_items
-
-                json_handle.write(json.dumps(json_record, ensure_ascii=False) + "\n")
-                json_handle.flush()
-
-                if checkpoint_handle:
-                    checkpoint_handle.write(filename + "\n")
-                    checkpoint_handle.flush()
-
-                completed_filenames.add(filename)
-                processed += 1
-                if args.sleep:
-                    time.sleep(args.sleep)
-        finally:
             if checkpoint_handle:
-                checkpoint_handle.close()
+                checkpoint_handle.write(filename + "\n")
+                checkpoint_handle.flush()
+
+            completed_filenames.add(filename)
+            processed += 1
+            if args.sleep:
+                time.sleep(args.sleep)
+    finally:
+        if checkpoint_handle:
+            checkpoint_handle.close()
+        output_router.close()
 
     elapsed = time.monotonic() - start_time
     elapsed_hours = elapsed / 3600
     cost_summary = format_cost_summary(args.power_watts, args.electric_rate, elapsed_hours, args.run_hours)
-    complete_msg = (
-        f"Completed {processed} new rows in {format_duration(elapsed)}. "
-        f"CSV saved to {args.output} | JSONL appended to {args.json_output}"
-    )
+    if args.chunk_size > 0:
+        complete_msg = (
+            f"Completed {processed} new rows in {format_duration(elapsed)}. "
+            f"Chunks saved under {args.chunk_dir} | manifest: {args.chunk_manifest}"
+        )
+    else:
+        complete_msg = (
+            f"Completed {processed} new rows in {format_duration(elapsed)}. "
+            f"CSV saved to {args.output} | JSONL appended to {args.json_output}"
+        )
     if cost_summary:
         complete_msg = f"{complete_msg}\n{cost_summary}"
     print(complete_msg)

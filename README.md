@@ -62,24 +62,28 @@ python gpt_ranker.py \
   --reasoning-effort low
 ```
 
+By default, the ranker writes **1,000-row chunks** to `contrib/` and updates `data/chunks.json`.  
+Set `--chunk-size 0` if you really want a single CSV/JSONL output (not recommended for sharing).
+
 Notable flags:
 
 - `--resume`: skips rows already present in the JSONL/checkpoint so you can stop/restart long runs.
 - `--checkpoint data/.epstein_checkpoint`: stores processed filenames to guard against duplication.
 - `--reasoning-effort low/high`: trade accuracy for speed if your model exposes the reasoning control knob.
-- `--reasoning-effort low/high`: trade accuracy for speed if your model exposes the reasoning control knob.
 - `--include-action-items`: opt-in if you want the LLM to list action items (off by default for brevity).
 - `--max-rows N`: smoke-test on a small subset.
 - `--list-models`: query your endpoint for available model IDs.
 - `--start-row`, `--end-row`: process only a slice of the dataset (ideal for collaborative chunking).
-- `--overwrite-output`: explicitly allow truncating existing CSV/JSONL files (default is to refuse and require `--resume` or a different path).
-- `--power-watts`, `--electric-rate`, `--run-hours`: plug in your local power draw/cost to estimate total electricity usage (also configurable via `ranker_config.toml`).
+- `--chunk-size`, `--chunk-dir`, `--chunk-manifest`: control chunk splitting, where chunk files live, and where the manifest is written.
+- `--overwrite-output`: explicitly allow truncating existing files (default is to refuse unless `--resume` or unique paths are used).
 - `--power-watts`, `--electric-rate`, `--run-hours`: plug in your local power draw/cost to estimate total electricity usage (also configurable via the TOML file).
 
 Outputs:
 
-- `data/epstein_ranked.csv` – Spreadsheet-friendly table (headline, score, tags, power mentions, agencies, lead types).
-- `data/epstein_ranked.jsonl` – Full JSON per document, including the original CSV row text for reproducibility.
+- `contrib/epstein_ranked_<start>_<end>.csv` – Spreadsheet-friendly chunk (headline, score, tags, power mentions, agencies, lead types).
+- `contrib/epstein_ranked_<start>_<end>.jsonl` – Full JSON for the same chunk, including the original row metadata.
+- `data/chunks.json` – Manifest listing all chunk files (the viewer ingests this automatically).
+- `data/epstein_ranked.csv/jsonl` – Only produced if you disable chunking via `--chunk-size 0`.
 
 ---
 
@@ -115,12 +119,13 @@ cd viewer && python -m http.server 9000
 
 Open <http://localhost:9000>. Features:
 
+- Automatically loads any chunk listed in `data/chunks.json` (falls back to `data/epstein_ranked.jsonl` if no chunks exist).
 - AG Grid table sorted by importance score (click a row to expand the detail drawer and read the entire document text).
 - Filters for score threshold, lead types, power mentions, ad hoc search, and row limits.
 - Charts showing lead-type distribution, score histogram, top power mentions, and top agencies.
 - Methodology accordion describing the scoring criteria, prompt, and compute footprint.
 
-`viewer/app.js` pulls from `data/epstein_ranked.jsonl`, so keep that file in sync with the latest run.
+`viewer/app.js` reads `data/chunks.json` by default, so remember to commit updated manifests + chunk files. If no manifest exists, it falls back to `data/epstein_ranked.jsonl`.
 
 ### Screenshots
 
@@ -146,14 +151,14 @@ Want to help process more of the corpus? Fork the repo, claim a range of rows, a
      --config ranker_config.toml \
      --start-row 1001 \
      --end-row 2000 \
-     --output contrib/epstein_ranked_1001_2000.csv \
-     --json-output contrib/epstein_ranked_1001_2000.jsonl \
-     --checkpoint contrib/.checkpoint_1001_2000.txt \
+     --chunk-dir contrib \
+     --chunk-manifest data/chunks.json \
      --known-json data/epstein_ranked.jsonl \
      --resume
    ```
 
-   This only processes documents in that range. `--known-json` makes the script aware of previously merged results (so duplicates are skipped automatically). Combine with `--resume` if you need to pause and continue later.
+   This only processes documents in that range, emits `contrib/epstein_ranked_<range>.{csv,jsonl}`, and updates the manifest.  
+   `--known-json` makes the script aware of previously merged results (so duplicates are skipped automatically). Combine with `--resume` if you need to pause and continue later.
 
 3. **Export your outputs** – store the resulting CSV/JSONL subset in `contrib/`. Suggested naming:
 

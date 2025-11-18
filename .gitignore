@@ -21,3 +21,4 @@ env/
 data/epstein_ranked.csv
 data/epstein_ranked.jsonl
 data/.epstein_checkpoint
+data/EPS_FILES_20K_NOV2026.csv
