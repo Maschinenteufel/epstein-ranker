@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Epstein Files Intelligence Briefing</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ag-grid-community@31.3.1/styles/ag-grid.css" />
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ag-grid-community@31.3.1/styles/ag-theme-alpine.css" />
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/choices.js/public/assets/styles/choices.min.css" />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header>
+      <div>
+        <h1>Epstein Files Intelligence Briefing</h1>
+        <p>Exploring potential leads across the document trove. Adjust filters to focus on controversies, power links, or investigative value.</p>
+      </div>
+      <div class="header-actions">
+        <button id="refreshButton" type="button">Reload Data</button>
+      </div>
+    </header>
+
+    <section class="controls">
+      <div class="control-group">
+        <label for="scoreFilter">Minimum Importance Score: <span id="scoreValue">0</span></label>
+        <input type="range" id="scoreFilter" min="0" max="100" value="0" step="1" />
+      </div>
+
+      <div class="control-group">
+        <label for="leadTypeFilter">Lead Types</label>
+        <select id="leadTypeFilter" multiple></select>
+      </div>
+
+      <div class="control-group">
+        <label for="powerFilter">Power Mentions</label>
+        <select id="powerFilter" multiple></select>
+      </div>
+
+      <div class="control-group stretch">
+        <label for="searchInput">Full-Text Search</label>
+        <input type="search" id="searchInput" placeholder="Search headline, insights, tags..." />
+      </div>
+
+      <div class="control-group small">
+        <label for="limitInput">Max Rows</label>
+        <input type="number" id="limitInput" min="0" step="100" placeholder="All" />
+      </div>
+
+      <div class="control-group small">
+        <label>&nbsp;</label>
+        <button id="resetFilters" type="button">Reset Filters</button>
+      </div>
+    </section>
+
+    <section class="summary" id="summaryPanel">
+      <div>
+        <p class="metric-label">Rows Loaded</p>
+        <p class="metric-value" id="countStat">0</p>
+      </div>
+      <div>
+        <p class="metric-label">Avg. Importance</p>
+        <p class="metric-value" id="avgStat">0</p>
+      </div>
+      <div>
+        <p class="metric-label">Top Lead Type</p>
+        <p class="metric-value" id="leadStat">–</p>
+      </div>
+      <div>
+        <p class="metric-label">Last Updated</p>
+        <p class="metric-value" id="updatedStat">–</p>
+      </div>
+    </section>
+
+    <section class="grid-panel">
+      <div id="grid" class="ag-theme-alpine"></div>
+    </section>
+
+    <section id="detailDrawer" class="detail-drawer hidden">
+      <div class="detail-header">
+        <div>
+          <p class="detail-label">Selected File</p>
+          <h2 id="detailTitle">Select a row to inspect full context</h2>
+          <p class="detail-hint">Click any row in the table to load its full reasoning and source text.</p>
+        </div>
+        <button id="detailClose" type="button">Close</button>
+      </div>
+      <div class="detail-content">
+        <article>
+          <h3>Reasoning</h3>
+          <p id="detailReason">—</p>
+          <h3>Key Insights</h3>
+          <ul id="detailInsights"></ul>
+        </article>
+        <article>
+          <h3>Lead Types</h3>
+          <p id="detailLeadTypes">—</p>
+          <h3>Power Mentions</h3>
+          <p id="detailPower">—</p>
+          <h3>Agencies</h3>
+          <p id="detailAgencies">—</p>
+        </article>
+        <article class="detail-text">
+          <h3>Original Text</h3>
+          <pre id="detailText">—</pre>
+        </article>
+      </div>
+    </section>
+
+    <section class="charts">
+      <article>
+        <h2>Lead Type Breakdown</h2>
+        <canvas id="leadChart" height="160"></canvas>
+      </article>
+      <article>
+        <h2>Importance Score Distribution</h2>
+        <canvas id="scoreChart" height="160"></canvas>
+      </article>
+      <article>
+        <h2>Top Power Mentions</h2>
+        <canvas id="powerChart" height="160"></canvas>
+      </article>
+      <article>
+        <h2>Top Agencies</h2>
+        <canvas id="agencyChart" height="160"></canvas>
+      </article>
+    </section>
+
+    <section class="methodology">
+      <h2>How the Importance Score Works</h2>
+      <p>
+        Each document is analyzed locally through LM Studio using the open-source OpenAI GPT-OSS-120B model, running entirely offline on
+        commodity hardware. The model scores passages from 0 (no meaningful lead) to 100 (critical revelation).
+      </p>
+      <details class="accordion" open>
+        <summary>Scoring criteria (click to toggle)</summary>
+        <ul>
+          <li><strong>Investigative usefulness:</strong> Are there concrete follow-ups such as names, transactions, or dates?</li>
+          <li><strong>Controversy &amp; sensitivity:</strong> Would confirmation trigger public scrutiny or legal risk?</li>
+          <li><strong>Novelty:</strong> Does this surface new information versus repeating well-known facts?</li>
+          <li><strong>Power linkage:</strong> Does the lead implicate heads of state, major financiers, intelligence services, or similar actors?</li>
+        </ul>
+        <p>Rows above ~70 typically warrant deeper review—they combine unusual claims with explicit power connections.</p>
+      </details>
+      <details class="accordion">
+        <summary>LLM prompt (full text)</summary>
+        <pre>
+You analyze primary documents related to court and investigative filings.
+Focus on whether the passage offers potential leads—even if unverified—that connect influential actors (presidents, cabinet officials, foreign leaders, billionaires, intelligence agencies) to controversial actions, financial flows, or possible misconduct.
+Score each passage on:
+  1. Investigative usefulness: Does it suggest concrete follow-up steps, names, transactions, dates, or relationships worth pursuing?
+  2. Controversy / sensitivity: Would the lead cause public outcry or legal risk if validated?
+  3. Novelty: Is this information new or rarely reported, versus already known?
+  4. Power linkage: Does it implicate high-ranking officials or major power centers? Leads tying unknown individuals only to minor issues should score lower.
+Assign an importance_score from 0 (no meaningful lead) to 100 (blockbuster lead linking powerful actors to fresh controversy). Reserve 70+ for claims that, if true, would represent major revelations or next-step investigations.
+Return strict JSON with the following fields:
+  - headline (string)
+  - importance_score (0-100 number)
+  - reason (string explaining score)
+  - key_insights (array of short bullet strings)
+  - tags (array of topical strings)
+  - power_mentions (array listing high-profile people or institutions mentioned; include titles or roles if possible)
+  - agency_involvement (array naming government, intelligence, or law-enforcement bodies involved or implicated)
+  - lead_types (array describing lead categories such as 'financial flow', 'legal exposure', 'foreign influence', 'sexual misconduct', etc.)
+If a category has no data, return an empty array for it.
+        </pre>
+      </details>
+      <p class="methodology-note">
+        Infrastructure: Apple MacBook Pro (M3 Max, 128&nbsp;GB RAM). Average draw ~100&nbsp;W, so a 60-hour batch consumes roughly 6&nbsp;kWh.
+        At SoCal off-peak rates (~$0.25/kWh) the full run costs about $1.50 in electricity, with zero cloud or API spend.
+      </p>
+
+      <h2>Source &amp; Credits</h2>
+      <p>
+        Raw text was sourced from the <em>20,000 Epstein Files</em> dataset prepared by <strong>tensonaut</strong>, who OCR’d ~25,000 pages released by
+        the House Oversight Committee and shared them publicly: <a href="https://www.reddit.com/r/LocalLLaMA/comments/1ozu5v4/20000_epstein_files_in_a_single_text_file/" target="_blank" rel="noreferrer">Reddit post</a>.
+        The processed CSV mirrors the Hugging Face release: <a href="https://huggingface.co/datasets/tensonaut/EPSTEIN_FILES_20K" target="_blank" rel="noreferrer">tensonaut/EPSTEIN_FILES_20K</a>.
+        This project builds atop that foundational OCR work to provide ranking and analysis layers.
+      </p>
+    </section>
+
+    <script src="https://cdn.jsdelivr.net/npm/ag-grid-community@31.3.1/dist/ag-grid-community.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/choices.js/public/assets/scripts/choices.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

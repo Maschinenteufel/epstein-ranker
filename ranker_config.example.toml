@@ -1,0 +1,21 @@
+# Sample configuration for gpt_ranker.py
+
+# Endpoint / model overrides
+endpoint = "http://localhost:5002/v1"
+model = "openai/gpt-oss-120b"
+reasoning_effort = "low"
+sleep = 0.1
+
+# Energy / cost defaults (watts, USD/kWh)
+power_watts = 100.0
+electric_rate = 0.25
+# Optionally provide expected hours if you want cost estimates independent of wall time.
+# run_hours = 60.0
+
+# Paths
+input = "data/EPS_FILES_20K_NOV2026.csv"
+output = "data/epstein_ranked.csv"
+json_output = "data/epstein_ranked.jsonl"
+checkpoint = "data/.epstein_checkpoint"
+# Example: reference other JSONL files to skip duplicates
+# known_json = ["data/master_results.jsonl", "contrib/epstein_ranked_0_1000.jsonl"]

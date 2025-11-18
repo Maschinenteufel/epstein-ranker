@@ -1,0 +1,23 @@
+# Python caches / environments
+__pycache__/
+*.pyc
+.Python
+.venv/
+venv/
+env/
+.env
+
+# macOS and editor noise
+.DS_Store
+.idea/
+.vscode/
+
+# Logs / artifacts
+*.log
+.mypy_cache/
+.pytest_cache/
+
+# Generated data outputs
+data/epstein_ranked.csv
+data/epstein_ranked.jsonl
+data/.epstein_checkpoint
