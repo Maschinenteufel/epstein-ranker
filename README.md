@@ -36,7 +36,7 @@ Huge thanks to **tensonaut** for the foundational OCR and dataset packaging; thi
 - Python 3.9+
 - `requests`
 - LM Studio (or another OpenAI-compatible gateway) serving `openai/gpt-oss-120b` locally at `http://localhost:5002/v1`
-- The dataset CSV (`data/EPS_FILES_20K_NOV2026.csv`). **Not included in this repo**—download it from Hugging Face and place it under `data/`.
+- The dataset CSV (`data/EPS_FILES_20K_NOV2026.csv`). **Not included in this repo**—download it from the Hugging Face link above and place it in `data/` (see `data/README.md` for instructions).
 
 Install Python deps (only `requests` is needed):
 
@@ -124,11 +124,13 @@ Open <http://localhost:9000>. Features:
 
 ### Screenshots
 
-![Table view](imgs/table.png)
+| Table View | Insights & Charts |
+| ---------- | ----------------- |
+| ![Table view](imgs/table.png) | ![Insights + charts](imgs/graphs.png) |
 
-![Insights + charts](imgs/graphs.png)
-
-![Methodology explainer](imgs/info.png)
+| Methodology Explainer |
+| --------------------- |
+| ![Methodology explainer](imgs/info.png) |
 
 ---
 
