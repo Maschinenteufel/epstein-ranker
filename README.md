@@ -10,6 +10,18 @@ The entire workflow operates on a single MacBook Pro (M3 Max, 128 GB RAM). Wit
 
 ---
 
+## Screenshots
+
+| Table View | Insights & Charts |
+| ---------- | ----------------- |
+| ![Table view](imgs/table.png) | ![Insights + charts](imgs/graphs.png) |
+
+| Methodology Explainer |
+| --------------------- |
+| ![Methodology explainer](imgs/info.png) |
+
+---
+
 ## Data source & provenance
 
 The repository’s base dataset is the **“20,000 Epstein Files”** text corpus prepared by [**tensonaut**](https://www.reddit.com/r/LocalLLaMA/comments/1ozu5v4/20000_epstein_files_in_a_single_text_file/), who OCR’d ~25,000 pages released by the U.S. House Committee on Oversight and Government Reform.  
@@ -183,16 +195,6 @@ Open <http://localhost:9000>. Features:
 - Methodology accordion describing the scoring criteria, prompt, and compute footprint.
 
 `viewer/app.js` reads `data/chunks.json` by default, so remember to commit updated manifests + chunk files. If no manifest exists, it automatically scans for files named `contrib/epstein_ranked_*.jsonl` before falling back to `data/epstein_ranked.jsonl`.
-
-### Screenshots
-
-| Table View | Insights & Charts |
-| ---------- | ----------------- |
-| ![Table view](imgs/table.png) | ![Insights + charts](imgs/graphs.png) |
-
-| Methodology Explainer |
-| --------------------- |
-| ![Methodology explainer](imgs/info.png) |
 
 ---
 
