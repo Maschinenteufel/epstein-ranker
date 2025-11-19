@@ -191,6 +191,12 @@ def parse_args() -> argparse.Namespace:
         help="Model identifier exposed by the server (check via --list-models).",
     )
     parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.0,
+        help="Temperature for model responses (0.0 = deterministic, higher = more random).",
+    )
+    parser.add_argument(
         "--prompt-file",
         type=Path,
         default=None,
@@ -370,13 +376,14 @@ def call_model(
     system_prompt: str,
     api_key: Optional[str],
     timeout: float,
+    temperature: float,
     reasoning_effort: Optional[str],
     config_metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Send the document to the local GPT server and return parsed JSON."""
     payload = {
         "model": model,
-        "temperature": 0,
+        "temperature": temperature,
         "messages": [
             {"role": "system", "content": system_prompt},
             {
@@ -794,10 +801,10 @@ def build_config_metadata(args: argparse.Namespace, prompt_source: str) -> Dict[
     metadata = {
         "endpoint": args.endpoint,
         "model": args.model,
-        "temperature": 0,
+        "temperature": args.temperature,
         "prompt_source": prompt_source,
     }
-    if args.reasoning_effort:
+    if args.reasoning_effort is not None:
         metadata["reasoning_effort"] = args.reasoning_effort
     if args.api_key:
         metadata["api_key_used"] = True
@@ -1094,6 +1101,7 @@ def main() -> None:
                     system_prompt=system_prompt,
                     api_key=args.api_key,
                     timeout=args.timeout,
+                    temperature=args.temperature,
                     reasoning_effort=args.reasoning_effort,
                     config_metadata=config_metadata,
                 )
