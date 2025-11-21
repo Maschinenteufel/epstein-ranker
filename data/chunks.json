@@ -1,8 +1,8 @@
 {
   "metadata": {
     "total_dataset_rows": 25800,
-    "rows_processed": 14995,
-    "last_updated": "2025-11-20 07:42:44"
+    "rows_processed": 16000,
+    "last_updated": "2025-11-20"
   },
   "chunks": [
     {
@@ -79,6 +79,11 @@
       "start_row": 14001,
       "end_row": 15000,
       "json": "contrib/epstein_ranked_14001_15000.jsonl"
+    },
+    {
+      "start_row": 15001,
+      "end_row": 16000,
+      "json": "contrib/epstein_ranked_15001_16000.jsonl"
     }
   ]
 }

@@ -1,6 +1,18 @@
+import { POWER_ALIASES } from "./power_aliases.js";
+
 const DATA_URL = "data/epstein_ranked.jsonl";
 const CHUNK_MANIFEST_URL = "data/chunks.json";
 const DEFAULT_CHUNK_SIZE = 1000;
+const POWER_ALIAS_MAP = {
+  "barack obama": ["barack obama", "obama", "barack", "president obama"],
+  "donald trump": ["donald trump", "trump", "donald j trump", "president trump"],
+  "joe biden": ["joe biden", "joseph biden", "president biden"],
+  "bill clinton": ["bill clinton", "william clinton", "william j clinton", "president clinton"],
+  "bill gates": ["bill gates", "william gates", "william h gates", "gates"],
+  "hillary clinton": ["hillary clinton", "hillary rodham clinton"],
+  "jeffrey epstein": ["jeffrey epstein", "jeff epstein", "epstein"],
+  "elon musk": ["elon musk", "elon r musk", "musk"],
+};
 
 const elements = {
   scoreFilter: document.getElementById("scoreFilter"),
@@ -10,7 +22,6 @@ const elements = {
   searchInput: document.getElementById("searchInput"),
   limitInput: document.getElementById("limitInput"),
   resetFilters: document.getElementById("resetFilters"),
-  refreshButton: document.getElementById("refreshButton"),
   countStat: document.getElementById("countStat"),
   avgStat: document.getElementById("avgStat"),
   leadStat: document.getElementById("leadStat"),
@@ -54,9 +65,15 @@ const state = {
   },
   currentLoadId: 0,
   activeRowId: null,
+  powerDisplayNames: {},
 };
 
+const powerAliasLookup = buildPowerAliasLookup(POWER_ALIASES);
+const canonicalPowerList = buildCanonicalPowerList(powerAliasLookup);
+const powerKeywordMap = buildPowerKeywordMap(POWER_ALIASES, powerAliasLookup);
+
 function resetLoadingState(title = "Loading Epstein Files…", subtitle = "Preparing data") {
+  state.powerDisplayNames = {};
   state.loading.loadedChunks = 0;
   state.loading.totalChunks = 0;
   if (elements.loadingOverlay) {
@@ -225,9 +242,146 @@ function parseJsonl(text) {
     .filter(Boolean);
 }
 
+function buildPowerAliasLookup(aliasMap) {
+  const lookup = new Map();
+  Object.entries(aliasMap || {}).forEach(([canonical, aliases]) => {
+    const canonicalKey = cleanPowerAlias(canonical);
+    if (canonicalKey && !lookup.has(canonicalKey)) {
+      lookup.set(canonicalKey, canonical);
+    }
+    (aliases || []).forEach((alias) => {
+      const key = cleanPowerAlias(alias);
+      if (!key) return;
+      if (!lookup.has(key)) {
+        lookup.set(key, canonical);
+      }
+    });
+  });
+  return lookup;
+}
+
+function buildCanonicalPowerList(lookup) {
+  const list = [];
+  const seen = new Set();
+  lookup.forEach((canonical) => {
+    const clean = cleanPowerAlias(canonical);
+    if (!clean || seen.has(clean)) return;
+    seen.add(clean);
+    list.push({ canonical, clean });
+  });
+  return list;
+}
+
+function buildPowerKeywordMap(aliasMap) {
+  const keywordMap = new Map();
+  Object.entries(aliasMap || {}).forEach(([canonical, aliases]) => {
+    const cleanCanonical = cleanPowerAlias(canonical);
+    if (!cleanCanonical) return;
+    const keywords = new Set();
+    keywords.add(cleanCanonical);
+    cleanCanonical.split(" ").forEach((token) => keywords.add(token));
+    (aliases || []).forEach((alias) => {
+      const cleanAlias = cleanPowerAlias(alias);
+      if (!cleanAlias) return;
+      keywords.add(cleanAlias);
+      cleanAlias.split(" ").forEach((token) => keywords.add(token));
+    });
+    keywordMap.set(canonical, Array.from(keywords));
+  });
+  return keywordMap;
+}
+
+function cleanPowerAlias(name) {
+  if (!name) return "";
+  return String(name)
+    .toLowerCase()
+    .replace(/[–—]/g, "-")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function normalizePowerMentions(values) {
+  const normalized = [];
+  const seen = new Set();
+  (values || []).forEach((originalName) => {
+    const candidates = generatePowerAliasCandidates(originalName);
+    let canonical = null;
+    for (const key of candidates.keys) {
+      canonical = powerAliasLookup.get(key);
+      if (canonical) break;
+    }
+    if (!canonical) {
+      // Fallback: try token match on the best key
+      const tokenFallback = findCanonicalByToken(candidates.bestKey);
+      if (tokenFallback) {
+        canonical = tokenFallback;
+      }
+    }
+    if (!canonical) {
+      canonical = originalName;
+    }
+    const display = typeof canonical === "string" ? canonical : originalName;
+    const displayKey = cleanPowerAlias(display);
+    if (displayKey && !seen.has(displayKey)) {
+      seen.add(displayKey);
+      normalized.push(display);
+    }
+  });
+  return normalized;
+}
+
+function generatePowerAliasCandidates(name) {
+  const result = { keys: [], bestKey: "" };
+  if (!name) return result;
+  const candidates = [];
+  const trimmed = String(name).trim();
+  candidates.push(trimmed);
+  const flipped = flipCommaName(trimmed);
+  if (flipped) candidates.push(flipped);
+  for (const candidate of candidates) {
+    const key = cleanPowerAlias(candidate);
+    if (key) {
+      result.keys.push(key);
+      if (!result.bestKey) {
+        result.bestKey = key;
+      }
+    }
+  }
+  return result;
+}
+
+function flipCommaName(name) {
+  if (!name || !name.includes(",")) return null;
+  const [last, rest] = name.split(",", 2).map((part) => part.trim());
+  if (!last || !rest) return null;
+  // Only flip simple personal-name patterns to avoid mangling organizations.
+  const lastIsSingleWord = /^[A-Za-z'.-]+$/.test(last);
+  const restWordCount = rest.split(/\s+/).filter(Boolean).length;
+  if (!lastIsSingleWord || restWordCount === 0 || restWordCount > 3) {
+    return null;
+  }
+  return `${rest} ${last}`.trim();
+}
+
+function findCanonicalByToken(key) {
+  if (!key || key.length < 3) return null;
+  const matches = canonicalPowerList.filter((item) => {
+    const words = item.clean.split(" ");
+    return words.includes(key);
+  });
+  if (matches.length === 1) {
+    return matches[0].canonical;
+  }
+  return null;
+}
+
 function normalizeRow(row) {
   const importance = Number(row.importance_score ?? 0);
   const arrays = (value) => (Array.isArray(value) ? value : []);
+  const rawPowers = arrays(row.power_mentions)
+    .map((p) => (typeof p === "string" ? p.trim() : String(p ?? "").trim()))
+    .filter(Boolean);
+  const normalizedPowers = normalizePowerMentions(rawPowers);
   const normalized = {
     filename: row.filename,
     source_row_index: row.metadata?.source_row_index ?? null,
@@ -236,7 +390,8 @@ function normalizeRow(row) {
     reason: row.reason || "",
     key_insights: arrays(row.key_insights),
     tags: arrays(row.tags),
-    power_mentions: arrays(row.power_mentions),
+    power_mentions_raw: rawPowers,
+    power_mentions: normalizedPowers.length > 0 ? normalizedPowers : rawPowers,
     agency_involvement: arrays(row.agency_involvement),
     lead_types: arrays(row.lead_types),
     metadata: row.metadata || {},
@@ -266,10 +421,15 @@ function populateFilters(data, preserveSelection = false) {
     row.power_mentions.forEach((p) => powerSet.add(p));
   });
   setChoiceOptions(state.leadChoices, Array.from(leadTypeSet).sort(), prevLead);
-  setChoiceOptions(state.powerChoices, Array.from(powerSet).sort(), prevPower);
+  setChoiceOptions(
+    state.powerChoices,
+    Array.from(powerSet).sort(),
+    prevPower,
+    powerKeywordMap
+  );
 }
 
-function setChoiceOptions(choiceInstance, values, previouslySelected = []) {
+function setChoiceOptions(choiceInstance, values, previouslySelected = [], keywordMap = null) {
   if (!choiceInstance) {
     return;
   }
@@ -279,6 +439,7 @@ function setChoiceOptions(choiceInstance, values, previouslySelected = []) {
   const options = values.map((value) => ({
     value,
     label: value,
+    customProperties: keywordMap ? { keywords: keywordMap.get(value) || [] } : undefined,
     selected: selectedSet.has(value),
   }));
   choiceInstance.clearChoices();
@@ -798,7 +959,6 @@ function wireEvents() {
   elements.leadFilter.addEventListener("change", applyFilters);
   elements.powerFilter.addEventListener("change", applyFilters);
   elements.resetFilters.addEventListener("click", resetFilters);
-  elements.refreshButton.addEventListener("click", () => loadData());
   elements.detailClose.addEventListener("click", () => clearDetail());
   elements.detailTextToggle.addEventListener("click", toggleDetailText);
 }
@@ -839,12 +999,26 @@ function initChoices() {
     placeholder: true,
     placeholderValue: "Select lead types",
     searchPlaceholderValue: "Search lead types",
+    searchResultLimit: 500,
+    renderChoiceLimit: 500,
+    fuseOptions: {
+      keys: ["label", "value", "customProperties.keywords"],
+      threshold: 0.3,
+      ignoreLocation: true,
+    },
   });
   state.powerChoices = new Choices(elements.powerFilter, {
     removeItemButton: true,
     placeholder: true,
     placeholderValue: "Select power mentions",
     searchPlaceholderValue: "Search people/agencies",
+    searchResultLimit: 500,
+    renderChoiceLimit: 500,
+    fuseOptions: {
+      keys: ["label", "value", "customProperties.keywords"],
+      threshold: 0.3,
+      ignoreLocation: true,
+    },
   });
 }
 

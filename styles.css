@@ -154,7 +154,31 @@ header p {
   color: var(--muted);
 }
 
-.header-actions button,
+.header-actions {
+  display: flex;
+  gap: 0.8rem;
+  align-items: center;
+}
+
+.support-link {
+  display: inline-block;
+  padding: 0.6rem 1.2rem;
+  background: rgba(90, 208, 255, 0.15);
+  color: var(--accent);
+  border: 1px solid rgba(90, 208, 255, 0.3);
+  border-radius: 8px;
+  text-decoration: none;
+  font-weight: 500;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+}
+
+.support-link:hover {
+  background: rgba(90, 208, 255, 0.25);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(90, 208, 255, 0.2);
+}
+
 button,
 input,
 select {
@@ -227,6 +251,11 @@ select[multiple] {
   color: inherit;
   min-height: 3rem;
   padding: 0.35rem;
+}
+
+.choices__list--dropdown {
+  max-height: 260px;
+  overflow-y: auto;
 }
 
 .choices__list--multiple .choices__item {
