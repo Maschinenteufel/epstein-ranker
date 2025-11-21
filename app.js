@@ -117,7 +117,7 @@ function finishInitialLoadingUI() {
   }
 }
 
-function setFiltersEnabled(enabled) {
+function setFiltersEnabled(enabled, { triggerApply = false } = {}) {
   state.filtersEnabled = !!enabled;
   const controls = [
     elements.scoreFilter,
@@ -130,6 +130,15 @@ function setFiltersEnabled(enabled) {
   controls.forEach((el) => {
     if (el) el.disabled = !enabled;
   });
+  if (state.leadChoices) {
+    enabled ? state.leadChoices.enable() : state.leadChoices.disable();
+  }
+  if (state.powerChoices) {
+    enabled ? state.powerChoices.enable() : state.powerChoices.disable();
+  }
+  if (enabled && triggerApply) {
+    applyFilters({ force: true });
+  }
 }
 
 function showInlineLoader(message) {
@@ -575,8 +584,9 @@ function getSelectedValues(choiceInstance) {
   return [];
 }
 
-function applyFilters() {
-  if (!state.filtersEnabled) return;
+function applyFilters(options = {}) {
+  const force = options.force || false;
+  if (!state.filtersEnabled && !force) return;
   const minScore = Number(elements.scoreFilter.value) || 0;
   elements.scoreValue.textContent = minScore.toString();
   const leadSelected = new Set(getSelectedValues(state.leadChoices));
@@ -939,7 +949,6 @@ async function loadData() {
     if (manifest && manifest.chunks && manifest.chunks.length > 0) {
       await loadChunks(manifest, loadId);
       finishInitialLoadingUI();
-      setFiltersEnabled(true);
       return;
     }
   } catch (err) {
@@ -949,7 +958,7 @@ async function loadData() {
   try {
     await loadSequentialChunks(DEFAULT_CHUNK_SIZE, 500, loadId);
     finishInitialLoadingUI();
-    setFiltersEnabled(true);
+    setFiltersEnabled(true, { triggerApply: true });
     return;
   } catch (seqErr) {
     console.warn("Sequential chunk scan failed, falling back to single file.", seqErr);
@@ -958,7 +967,7 @@ async function loadData() {
   try {
     await loadSingleFile(loadId);
     finishInitialLoadingUI();
-    setFiltersEnabled(true);
+    setFiltersEnabled(true, { triggerApply: true });
   } catch (error) {
     console.error("Failed to load data", error);
     finishInitialLoadingUI();
@@ -1026,6 +1035,7 @@ async function loadChunks(manifestData, loadId, initialChunkCount = 2) {
 
   if (chunks.length <= initialBatch.length) {
     hideInlineLoader();
+    setFiltersEnabled(true, { triggerApply: true });
     return;
   }
 
@@ -1049,6 +1059,7 @@ async function backgroundLoadChunks(chunks, loadId) {
   }
   if (loadId === state.currentLoadId) {
     hideInlineLoader();
+    setFiltersEnabled(true, { triggerApply: true });
   }
 }
 
@@ -1136,7 +1147,7 @@ async function hydrateRows(rows, { append = false, preserveFilters = false } = {
   state.raw = append ? state.raw.concat(normalized) : normalized;
   state.lastUpdated = new Date();
   populateFilters(state.raw, preserveFilters);
-  applyFilters();
+  applyFilters({ force: true });
 }
 
 function resolveChunkPath(path) {
@@ -1166,7 +1177,7 @@ function resetFilters() {
   state.powerChoices?.removeActiveItems();
   elements.searchInput.value = "";
   elements.limitInput.value = "";
-  applyFilters();
+  applyFilters({ force: true });
 }
 
 function wireEvents() {
