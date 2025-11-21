@@ -1200,8 +1200,8 @@ function renderDetail(row, options = {}) {
       ? row.key_insights.map((item) => `<li>${escapeHtml(item)}</li>`).join("")
       : "<li>—</li>";
 
-  // Scroll to detail drawer on mobile only when user clicks a row
-  if (options.scrollToDetail && isMobileView()) {
+  // Scroll to detail drawer when user clicks a row
+  if (options.scrollToDetail) {
     setTimeout(() => {
       elements.detailDrawer.scrollIntoView({ behavior: "smooth", block: "start" });
     }, 100);
