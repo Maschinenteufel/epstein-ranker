@@ -1443,7 +1443,8 @@ function renderDetail(row, options = {}) {
   // Get terms to highlight
   const highlightTerms = getHighlightTerms();
 
-  elements.detailTitle.textContent = `${row.headline || row.filename} (${row.filename})`;
+  const headlineText = `${row.headline || row.filename} (${row.filename})`;
+  elements.detailTitle.innerHTML = highlightText(headlineText, highlightTerms);
   elements.detailReason.innerHTML = highlightText(row.reason || "—", highlightTerms);
   elements.detailLeadTypes.innerHTML = highlightText(row.lead_types.join(", ") || "—", highlightTerms);
   elements.detailPower.innerHTML = highlightText(row.power_mentions.join(", ") || "—", highlightTerms);
@@ -1486,7 +1487,7 @@ function renderDetail(row, options = {}) {
 function clearDetail() {
   elements.detailDrawer.classList.add("hidden");
   state.activeRowId = null;
-  elements.detailTitle.textContent = "Select a row to inspect full context";
+  elements.detailTitle.innerHTML = "Select a row to inspect full context";
   elements.detailReason.innerHTML = "—";
   elements.detailLeadTypes.innerHTML = "—";
   elements.detailPower.innerHTML = "—";
