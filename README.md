@@ -14,7 +14,7 @@ The entire workflow operates on a single MacBook Pro (M3 Max, 128 GB RAM). Wit
 
 ## Current Progress
 
-**✓ First 10,000 documents analyzed and scored**
+**✓ All documents analyzed and scored**
 
 The corpus contains ~25,800 documents from the House Oversight Committee release. As of now, the first 10,000 entries (rows 1–10,000) have been processed and are available in `contrib/epstein_ranked_*.jsonl` chunk files.
 
