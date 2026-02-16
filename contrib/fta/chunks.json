@@ -1,8 +1,8 @@
 {
   "metadata": {
     "total_dataset_rows": "unknown",
-    "rows_processed": 1248,
-    "last_updated": "2026-02-15 23:14:24"
+    "rows_processed": 1530,
+    "last_updated": "2026-02-15 23:46:53"
   },
   "chunks": [
     {
@@ -34,6 +34,11 @@
       "start_row": 1,
       "end_row": 1000,
       "json": "contrib/fta/VOL00007/epstein_ranked_00001_01000.jsonl"
+    },
+    {
+      "start_row": 1,
+      "end_row": 1000,
+      "json": "contrib/fta/VOL00011/epstein_ranked_00001_01000.jsonl"
     },
     {
       "start_row": 1,

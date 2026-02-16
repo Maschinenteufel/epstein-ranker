@@ -340,6 +340,25 @@ def parse_args() -> argparse.Namespace:
         help="Limit processing to the first N rows (useful for smoke-tests).",
     )
     parser.add_argument(
+        "--workload-scan",
+        choices=["auto", "full", "defer"],
+        default="auto",
+        help=(
+            "Control upfront workload counting: full scans all rows before processing; "
+            "defer starts processing immediately without exact upfront totals; "
+            "auto uses defer for image directory + PDF split runs, otherwise full."
+        ),
+    )
+    parser.add_argument(
+        "--workload-estimate-sample-size",
+        type=int,
+        default=64,
+        help=(
+            "When workload scanning is deferred, sample up to N PDFs to estimate "
+            "split-part totals and ETA."
+        ),
+    )
+    parser.add_argument(
         "--sleep",
         type=float,
         default=0.0,

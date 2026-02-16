@@ -742,6 +742,98 @@ def calculate_workload(
     return {"total": total, "already_done": already_done, "workload": workload}
 
 
+def estimate_workload_fast(
+    path: Path,
+    *,
+    input_glob: str,
+    processing_mode: str,
+    pdf_part_pages: int,
+    completed_source_ids: Set[str],
+    start_row: int,
+    end_row: Optional[int],
+    max_rows: Optional[int],
+    sample_size: int,
+) -> Optional[Dict[str, Any]]:
+    if not path.is_dir():
+        return None
+
+    total_files = 0
+    pdf_files = 0
+    base_rows = 0
+    sampled_pdf_paths: List[Path] = []
+    for file_path in sorted(path.rglob(input_glob)):
+        if not file_path.is_file():
+            continue
+        input_kind = infer_row_input_kind(file_path, processing_mode)
+        if not input_kind:
+            continue
+        total_files += 1
+        if (
+            input_kind == "image"
+            and file_path.suffix.lower() == ".pdf"
+            and pdf_part_pages > 0
+        ):
+            pdf_files += 1
+            if len(sampled_pdf_paths) < sample_size:
+                sampled_pdf_paths.append(file_path)
+        else:
+            base_rows += 1
+
+    if total_files == 0:
+        return {
+            "estimated_total": 0,
+            "estimated_total_in_range": 0,
+            "estimated_workload": 0,
+            "estimated_already_done": 0,
+            "total_files": 0,
+            "pdf_files": 0,
+            "sampled_pdf_count": 0,
+            "avg_parts_per_pdf": 1.0,
+            "avg_pages_per_pdf": None,
+        }
+
+    avg_parts_per_pdf = 1.0
+    avg_pages_per_pdf: Optional[float] = None
+    sampled_pdf_count = 0
+    if pdf_files > 0 and pdf_part_pages > 0 and sampled_pdf_paths:
+        sampled_parts: List[int] = []
+        sampled_pages: List[int] = []
+        for pdf_path in sampled_pdf_paths:
+            total_pages = detect_pdf_page_count(pdf_path)
+            if total_pages is None or total_pages <= 0:
+                continue
+            sampled_pdf_count += 1
+            sampled_pages.append(total_pages)
+            sampled_parts.append(max(1, math.ceil(total_pages / pdf_part_pages)))
+        if sampled_parts:
+            avg_parts_per_pdf = sum(sampled_parts) / len(sampled_parts)
+            avg_pages_per_pdf = sum(sampled_pages) / len(sampled_pages)
+
+    estimated_total = int(round(base_rows + (pdf_files * avg_parts_per_pdf)))
+    start_index = max(1, start_row)
+    end_index = end_row if end_row is not None else estimated_total
+    estimated_total_in_range = max(0, min(end_index, estimated_total) - start_index + 1)
+    estimated_already_done = min(
+        estimated_total_in_range,
+        len(completed_source_ids) if completed_source_ids else 0,
+    )
+    estimated_workload = max(0, estimated_total_in_range - estimated_already_done)
+    if max_rows is not None:
+        estimated_workload = min(estimated_workload, max_rows)
+
+    return {
+        "estimated_total": estimated_total,
+        "estimated_total_in_range": estimated_total_in_range,
+        "estimated_workload": estimated_workload,
+        "estimated_already_done": estimated_already_done,
+        "total_files": total_files,
+        "pdf_files": pdf_files,
+        "sampled_pdf_count": sampled_pdf_count,
+        "avg_parts_per_pdf": avg_parts_per_pdf,
+        "avg_pages_per_pdf": avg_pages_per_pdf,
+    }
+
+
 def format_duration(seconds: float) -> str:
     seconds = max(0, int(round(seconds)))
     hours, remainder = divmod(seconds, 3600)
@@ -1692,6 +1784,8 @@ def main() -> None:
         sys.exit("--image-jpeg-quality must be between 1 and 95")
     if args.image_max_side < 0:
         sys.exit("--image-max-side must be >= 0")
+    if args.workload_estimate_sample_size < 1:
+        sys.exit("--workload-estimate-sample-size must be >= 1")
     if args.max_output_tokens < 1:
         sys.exit("--max-output-tokens must be >= 1")
     for price_name in (
@@ -1836,44 +1930,121 @@ def main() -> None:
     if completed_source_ids:
         print(f"Skipping {len(completed_source_ids)} pre-processed source ids.")
 
-    workload_progress_label: Optional[str] = None
-    if active_processing_mode == "image" and args.input.is_dir():
-        workload_progress_label = (
-            "Planning workload (PDF split/page detection can take time on large volumes)"
-        )
-        print("Planning workload before request submission...", flush=True)
+    workload_scan_mode = args.workload_scan
+    if workload_scan_mode == "auto":
+        if active_processing_mode == "image" and args.input.is_dir() and args.pdf_part_pages > 0:
+            workload_scan_mode = "defer"
+        else:
+            workload_scan_mode = "full"
 
-    workload_stats = calculate_workload(
-        args.input,
-        input_glob=args.input_glob,
-        processing_mode=active_processing_mode,
-        pdf_part_pages=args.pdf_part_pages,
-        max_rows=args.max_rows,
-        completed_filenames=completed_source_ids if args.resume else set(),
-        start_row=args.start_row,
-        end_row=args.end_row,
-        progress_label=workload_progress_label,
-    )
-    total_candidates = workload_stats["total"]
-    already_done = workload_stats["already_done"] if args.resume else 0
-    target_total = workload_stats["workload"]
-    if target_total <= 0:
-        print("No new rows to process. Exiting.")
-        return
+    workload_scanned = workload_scan_mode == "full"
+    workload_stats: Dict[str, int] = {"total": 0, "already_done": 0, "workload": 0}
+    total_candidates = 0
+    already_done = 0
+    target_total: Optional[int] = None
+    target_total_is_estimate = False
+
+    if workload_scanned:
+        workload_progress_label: Optional[str] = None
+        if active_processing_mode == "image" and args.input.is_dir():
+            workload_progress_label = (
+                "Planning workload (PDF split/page detection can take time on large volumes)"
+            )
+            print("Planning workload before request submission...", flush=True)
+
+        workload_stats = calculate_workload(
+            args.input,
+            input_glob=args.input_glob,
+            processing_mode=active_processing_mode,
+            pdf_part_pages=args.pdf_part_pages,
+            max_rows=args.max_rows,
+            completed_filenames=completed_source_ids if args.resume else set(),
+            start_row=args.start_row,
+            end_row=args.end_row,
+            progress_label=workload_progress_label,
+        )
+        total_candidates = workload_stats["total"]
+        already_done = workload_stats["already_done"] if args.resume else 0
+        target_total = workload_stats["workload"]
+        if target_total <= 0:
+            print("No new rows to process. Exiting.")
+            return
+    else:
+        print(
+            "Workload scan deferred: starting processing immediately without upfront total-row counting.",
+            flush=True,
+        )
+        print("Estimating workload quickly for ETA guidance...", flush=True)
+        estimated_stats = estimate_workload_fast(
+            args.input,
+            input_glob=args.input_glob,
+            processing_mode=active_processing_mode,
+            pdf_part_pages=args.pdf_part_pages,
+            completed_source_ids=completed_source_ids if args.resume else set(),
+            start_row=args.start_row,
+            end_row=args.end_row,
+            max_rows=args.max_rows,
+            sample_size=args.workload_estimate_sample_size,
+        )
+        if estimated_stats:
+            target_total = int(estimated_stats["estimated_workload"])
+            target_total_is_estimate = True
+            total_candidates = int(estimated_stats["estimated_total_in_range"])
+            already_done = int(estimated_stats["estimated_already_done"])
+            workload_stats = {
+                "total": total_candidates,
+                "already_done": already_done,
+                "workload": target_total,
+            }
+            avg_pages = estimated_stats.get("avg_pages_per_pdf")
+            avg_pages_msg = (
+                f"{avg_pages:.1f} avg pages/PDF"
+                if isinstance(avg_pages, (int, float))
+                else "unknown avg pages/PDF"
+            )
+            print(
+                "Estimated workload: "
+                f"~{target_total:,} pending row(s) within requested range "
+                f"(~{total_candidates:,} total, ~{already_done:,} already done) | "
+                f"files={estimated_stats['total_files']:,}, pdfs={estimated_stats['pdf_files']:,}, "
+                f"sampled={estimated_stats['sampled_pdf_count']:,}, "
+                f"~{estimated_stats['avg_parts_per_pdf']:.2f} parts/PDF ({avg_pages_msg}).",
+                flush=True,
+            )
+
     range_desc = f"rows {args.start_row}-{args.end_row if args.end_row else 'end'}"
-    print(
-        f"Processing {target_total} new rows within {range_desc} "
-        f"(skipping {already_done} already completed, total considered {total_candidates})."
-    )
+    if target_total is not None:
+        if target_total_is_estimate:
+            print(
+                f"Processing ~{target_total} estimated new rows within {range_desc} "
+                f"(~{already_done} already completed, ~{total_candidates} total considered).",
+                flush=True,
+            )
+        else:
+            print(
+                f"Processing {target_total} new rows within {range_desc} "
+                f"(skipping {already_done} already completed, total considered {total_candidates})."
+            )
+    else:
+        print(
+            f"Processing {range_desc} with deferred workload totals "
+            "(ETA will use completed-row rate only).",
+            flush=True,
+        )
 
     output_router = OutputRouter(args, fieldnames)
     total_dataset_rows: Optional[int] = None
-    can_reuse_workload_total = (
+    can_reuse_workload_total = workload_scanned and (
         args.start_row == 1 and args.end_row is None and args.max_rows is None
     )
 
     # Count total rows in dataset for manifest metadata
-    if output_router.mode == "chunk" and can_reuse_workload_total:
+    if output_router.mode == "chunk" and workload_scan_mode == "defer":
+        print(
+            "Dataset total-row counting deferred in chunk mode; manifest metadata will use 'unknown'.",
+            flush=True,
+        )
+    elif output_router.mode == "chunk" and can_reuse_workload_total:
         output_router.total_dataset_rows = total_candidates
         total_dataset_rows = output_router.total_dataset_rows
         print(
@@ -1895,6 +2066,8 @@ def main() -> None:
         )
         total_dataset_rows = output_router.total_dataset_rows
         print(f"Total dataset: {output_router.total_dataset_rows:,} rows")
+    elif workload_scan_mode == "defer" and args.run_metadata_file:
+        total_dataset_rows = None
     elif can_reuse_workload_total and args.run_metadata_file:
         total_dataset_rows = total_candidates
     elif args.run_metadata_file:
@@ -2175,14 +2348,17 @@ def main() -> None:
             # Show source row index and submission progress.
             # In parallel mode, completed-row counters lag while requests are in flight.
             if target_total:
-                progress_prefix = f"[Row {idx}] [{scheduled}/{target_total} new]"
+                if target_total_is_estimate:
+                    progress_prefix = f"[Row {idx}] [{scheduled}/~{target_total} est.]"
+                else:
+                    progress_prefix = f"[Row {idx}] [{scheduled}/{target_total} new]"
             else:
                 progress_prefix = f"[Row {idx}] [{scheduled}]"
 
             eta_text = format_eta(
                 start_time,
                 eta_completed,
-                target_total,
+                target_total or 0,
                 args.power_watts,
                 args.electric_rate,
                 api_cost_usd_total if api_rows_with_cost > 0 else None,
