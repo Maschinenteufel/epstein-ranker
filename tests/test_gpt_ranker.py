@@ -146,6 +146,46 @@ class GptRankerHelpersTest(unittest.TestCase):
         self.assertEqual(json_record["metadata"]["skip_reason"], "empty text")
         self.assertEqual(csv_row["source_pdf_url"], "")
 
+    def test_build_output_records_includes_api_usage_and_cost_fields(self) -> None:
+        source_row = {"filename": "sample.txt", "text": ""}
+        result = {
+            "headline": "h",
+            "importance_score": 9,
+            "reason": "r",
+            "key_insights": [],
+            "tags": [],
+            "power_mentions": [],
+            "agency_involvement": [],
+            "lead_types": [],
+            "_request_meta": {
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 3,
+                    "total_tokens": 13,
+                },
+                "model_cost": {
+                    "source": "estimated",
+                    "total_cost_usd": 0.00042,
+                },
+            },
+        }
+        csv_row, json_record = gpt_ranker.build_output_records(
+            idx=1,
+            source_row=source_row,
+            result=result,
+            args=self.skip_args,
+            config_metadata={"model": "qwen/qwen3-vl-30b"},
+            quality={},
+            processing_status="processed",
+            skip_reason="",
+        )
+        self.assertEqual(csv_row["api_prompt_tokens"], 10)
+        self.assertEqual(csv_row["api_completion_tokens"], 3)
+        self.assertEqual(csv_row["api_total_tokens"], 13)
+        self.assertEqual(csv_row["api_cost_source"], "estimated")
+        self.assertEqual(json_record["api_total_tokens"], 13)
+        self.assertAlmostEqual(json_record["api_cost_usd"], 0.00042)
+
     def test_build_output_records_includes_part_metadata(self) -> None:
         source_row = {
             "filename": "VOL00003/IMAGES/0001/EFTA00000001.pdf",
@@ -188,6 +228,19 @@ class GptRankerHelpersTest(unittest.TestCase):
         self.assertEqual(csv_row["part_total"], 5)
         self.assertEqual(json_record["document_total_pages"], 117)
         self.assertEqual(json_record["metadata"]["part_start_page"], 25)
+
+    def test_normalize_power_mentions_collapses_initial_aliases(self) -> None:
+        mentions = [
+            "Jeffrey Epstein",
+            "Jeffrey",
+            "J.E.",
+            "J",
+            "J. Epstein",
+            "J. E.",
+            "J. E. Epstein",
+        ]
+        normalized = gpt_ranker.normalize_power_mentions(mentions)
+        self.assertEqual(normalized, ["Jeffrey Epstein"])
 
     def test_derive_justice_pdf_url_from_dataset_path(self) -> None:
         filename = "DataSet10/IMAGES/0332/EFTA01970985.txt"
@@ -421,6 +474,80 @@ class GptRankerHelpersTest(unittest.TestCase):
             )
         self.assertEqual(result["headline"], "h")
         self.assertTrue(mocked_post.call_args.kwargs["url"].endswith("/chat"))
+
+    def test_call_model_openai_extracts_usage_and_provider_cost(self) -> None:
+        response_payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": (
+                            '{"headline":"h","importance_score":1,"reason":"r",'
+                            '"key_insights":[],"tags":[],"power_mentions":[],'
+                            '"agency_involvement":[],"lead_types":[]}'
+                        )
+                    }
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 1200,
+                "completion_tokens": 300,
+                "total_tokens": 1500,
+                "prompt_tokens_details": {"cached_tokens": 200},
+            },
+            "cost": 0.00123,
+        }
+        with mock.patch.object(gpt_ranker, "post_request", return_value=response_payload):
+            result = gpt_ranker.call_model(
+                endpoint="https://openrouter.ai/api/v1",
+                api_format="openai",
+                model="qwen/qwen3-vl-30b-a3b-instruct",
+                filename="DataSet3/EFTA00004066.pdf",
+                text="text",
+                input_kind="text",
+                image_path=None,
+                image_max_pages=1,
+                image_render_dpi=120,
+                system_prompt="Return JSON",
+                api_key="test-key",
+                timeout=30,
+                max_retries=1,
+                retry_backoff=0,
+                temperature=0.0,
+                max_output_tokens=256,
+                reasoning_effort=None,
+                image_detail="low",
+                config_metadata=None,
+            )
+
+        meta = result["_request_meta"]
+        self.assertEqual(meta["usage"]["prompt_tokens"], 1200)
+        self.assertEqual(meta["usage"]["completion_tokens"], 300)
+        self.assertEqual(meta["usage"]["total_tokens"], 1500)
+        self.assertEqual(meta["usage"]["cache_read_tokens"], 200)
+        self.assertAlmostEqual(meta["provider_reported_cost_usd"], 0.00123)
+
+    def test_attach_request_usage_and_cost_estimates_from_prices(self) -> None:
+        result = {
+            "_request_meta": {
+                "usage": {
+                    "prompt_tokens": 1_000_000,
+                    "completion_tokens": 1_000_000,
+                    "total_tokens": 2_000_000,
+                }
+            }
+        }
+        args = argparse.Namespace(
+            input_price_per_1m=0.13,
+            output_price_per_1m=0.52,
+            cache_read_price_per_1m=None,
+            cache_write_price_per_1m=None,
+        )
+        gpt_ranker.attach_request_usage_and_cost(result, args)
+        model_cost = result["_request_meta"]["model_cost"]
+        self.assertEqual(model_cost["source"], "estimated")
+        self.assertAlmostEqual(model_cost["input_cost_usd"], 0.13)
+        self.assertAlmostEqual(model_cost["output_cost_usd"], 0.52)
+        self.assertAlmostEqual(model_cost["total_cost_usd"], 0.65)
 
     def test_call_model_auto_falls_back_to_chat_endpoint(self) -> None:
         response_payload = {

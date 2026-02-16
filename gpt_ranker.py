@@ -363,6 +363,104 @@ def normalize_text_list(values: List[str], *, strip_descriptor: bool = False) ->
     return normalized
 
 
+def _name_tokens(value: str) -> List[str]:
+    return [token.lower() for token in re.findall(r"[A-Za-z]+", value)]
+
+
+def _is_full_name_candidate(value: str) -> bool:
+    tokens = _name_tokens(value)
+    if len(tokens) < 2:
+        return False
+    # Canonical full names should not start/end with initials.
+    if len(tokens[0]) <= 1 or len(tokens[-1]) <= 1:
+        return False
+    # Require at least two substantive tokens.
+    return sum(1 for token in tokens if len(token) > 1) >= 2
+
+
+def _is_alias_of_full_name(alias: str, canonical_full: str) -> bool:
+    alias_tokens = _name_tokens(alias)
+    full_tokens = _name_tokens(canonical_full)
+    if not alias_tokens or not full_tokens:
+        return False
+    if alias_tokens == full_tokens:
+        return False
+
+    full_initials = [token[0] for token in full_tokens]
+
+    # Single-token aliases like first name, last name, or first initial.
+    if len(alias_tokens) == 1:
+        token = alias_tokens[0]
+        if token == full_tokens[0] or token == full_tokens[-1]:
+            return True
+        if len(token) == 1 and token == full_initials[0]:
+            return True
+
+    # Initial-only aliases (e.g., "J.E." -> ["j", "e"]).
+    if len(alias_tokens) <= len(full_initials) and all(len(token) == 1 for token in alias_tokens):
+        if alias_tokens == full_initials[: len(alias_tokens)]:
+            return True
+
+    # Last-name forms with initials/partials (e.g., "J. Epstein", "J. E. Epstein").
+    if alias_tokens[-1] == full_tokens[-1]:
+        prefix = alias_tokens[:-1]
+        if not prefix:
+            return True
+        if all(len(token) == 1 for token in prefix) and prefix[0] == full_initials[0]:
+            return True
+        if len(alias_tokens) > len(full_tokens):
+            return False
+        matches_prefix = True
+        for idx, token in enumerate(prefix):
+            if idx >= len(full_tokens) - 1:
+                matches_prefix = False
+                break
+            full_token = full_tokens[idx]
+            if token == full_token:
+                continue
+            if len(token) == 1 and token == full_token[0]:
+                continue
+            matches_prefix = False
+            break
+        if matches_prefix:
+            return True
+
+    # First-name partial forms (e.g., "Jeffrey E.").
+    if alias_tokens[0] == full_tokens[0] and len(alias_tokens) < len(full_tokens):
+        matches = True
+        for idx, token in enumerate(alias_tokens):
+            if idx >= len(full_tokens):
+                matches = False
+                break
+            full_token = full_tokens[idx]
+            if token == full_token:
+                continue
+            if len(token) == 1 and token == full_token[0]:
+                continue
+            matches = False
+            break
+        if matches:
+            return True
+
+    return False
+
+
+def normalize_power_mentions(values: List[str]) -> List[str]:
+    normalized = normalize_text_list(values, strip_descriptor=True)
+    canonical_full_names = [value for value in normalized if _is_full_name_candidate(value)]
+    if not canonical_full_names:
+        return normalized
+    collapsed: List[str] = []
+    for value in normalized:
+        if value in canonical_full_names:
+            collapsed.append(value)
+            continue
+        if any(_is_alias_of_full_name(value, full_name) for full_name in canonical_full_names):
+            continue
+        collapsed.append(value)
+    return collapsed
+
+
 def max_repeated_char_run(text: str) -> int:
     longest = 0
     current = 0
@@ -617,6 +715,8 @@ def format_eta(
     total: int,
     power_watts: Optional[float] = None,
     electric_rate: Optional[float] = None,
+    api_cost_usd_total: Optional[float] = None,
+    completion_times: Optional[Deque[float]] = None,
 ) -> str:
     if total <= 0:
         return ""
@@ -626,6 +726,15 @@ def format_eta(
     if elapsed <= 0:
         return "(ETA --:--:--)"
     rate = processed / elapsed
+    if completion_times and len(completion_times) >= 2:
+        window_span = completion_times[-1] - completion_times[0]
+        if window_span > 0:
+            window_rate = (len(completion_times) - 1) / window_span
+            if rate > 0:
+                # Blend global average with recent throughput to reduce jitter.
+                rate = (rate * 0.35) + (window_rate * 0.65)
+            else:
+                rate = window_rate
     if rate <= 0:
         return "(ETA --:--:--)"
     remaining = max(total - processed, 0)
@@ -640,8 +749,203 @@ def format_eta(
         energy_cost = calculate_energy_cost(power_watts, electric_rate, total_estimated_hours)
         if energy_cost:
             eta_msg += f" | Est. total: {energy_cost['energy_kwh']:.2f} kWh / ${energy_cost['cost_usd']:.2f}"
+    if api_cost_usd_total is not None and api_cost_usd_total > 0 and processed > 0:
+        total_model_cost = (api_cost_usd_total / processed) * total
+        eta_msg += f" | API est. ${total_model_cost:.2f}"
 
     return eta_msg
+
+
+def _as_int(value: Any) -> Optional[int]:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return max(0, value)
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return None
+        return max(0, int(round(value)))
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        try:
+            return max(0, int(stripped))
+        except ValueError:
+            try:
+                parsed = float(stripped)
+            except ValueError:
+                return None
+            if math.isnan(parsed) or math.isinf(parsed):
+                return None
+            return max(0, int(round(parsed)))
+    return None
+
+
+def _as_float(value: Any) -> Optional[float]:
+    if isinstance(value, bool):
+        return float(value)
+    if isinstance(value, (int, float)):
+        numeric = float(value)
+        if math.isnan(numeric) or math.isinf(numeric):
+            return None
+        return numeric
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        try:
+            numeric = float(stripped)
+        except ValueError:
+            return None
+        if math.isnan(numeric) or math.isinf(numeric):
+            return None
+        return numeric
+    return None
+
+
+def normalize_token_usage(value: Any) -> Dict[str, int]:
+    if not isinstance(value, dict):
+        return {}
+    prompt_tokens = _as_int(value.get("prompt_tokens"))
+    completion_tokens = _as_int(value.get("completion_tokens"))
+    total_tokens = _as_int(value.get("total_tokens"))
+    cache_read_tokens = _as_int(value.get("cache_read_tokens"))
+    cache_write_tokens = _as_int(value.get("cache_write_tokens"))
+
+    if total_tokens is None and prompt_tokens is not None and completion_tokens is not None:
+        total_tokens = prompt_tokens + completion_tokens
+    if prompt_tokens is None and total_tokens is not None and completion_tokens is not None:
+        prompt_tokens = max(total_tokens - completion_tokens, 0)
+    if completion_tokens is None and total_tokens is not None and prompt_tokens is not None:
+        completion_tokens = max(total_tokens - prompt_tokens, 0)
+
+    normalized: Dict[str, int] = {}
+    if prompt_tokens is not None:
+        normalized["prompt_tokens"] = prompt_tokens
+    if completion_tokens is not None:
+        normalized["completion_tokens"] = completion_tokens
+    if total_tokens is not None:
+        normalized["total_tokens"] = total_tokens
+    if cache_read_tokens is not None:
+        normalized["cache_read_tokens"] = cache_read_tokens
+    if cache_write_tokens is not None:
+        normalized["cache_write_tokens"] = cache_write_tokens
+    return normalized
+
+
+def estimate_token_cost_from_usage(
+    usage: Dict[str, int],
+    *,
+    input_price_per_1m: Optional[float],
+    output_price_per_1m: Optional[float],
+    cache_read_price_per_1m: Optional[float],
+    cache_write_price_per_1m: Optional[float],
+) -> Optional[Dict[str, float]]:
+    if (
+        input_price_per_1m is None
+        and output_price_per_1m is None
+        and cache_read_price_per_1m is None
+        and cache_write_price_per_1m is None
+    ):
+        return None
+
+    prompt_tokens = usage.get("prompt_tokens", 0)
+    completion_tokens = usage.get("completion_tokens", 0)
+    cache_read_tokens = usage.get("cache_read_tokens", 0)
+    cache_write_tokens = usage.get("cache_write_tokens", 0)
+    billable_input_tokens = prompt_tokens
+    if cache_read_price_per_1m is not None:
+        billable_input_tokens = max(0, billable_input_tokens - cache_read_tokens)
+    if cache_write_price_per_1m is not None:
+        billable_input_tokens = max(0, billable_input_tokens - cache_write_tokens)
+
+    usage_million = 1_000_000.0
+    input_cost_usd = (
+        (billable_input_tokens / usage_million) * input_price_per_1m
+        if input_price_per_1m is not None
+        else 0.0
+    )
+    output_cost_usd = (
+        (completion_tokens / usage_million) * output_price_per_1m
+        if output_price_per_1m is not None
+        else 0.0
+    )
+    cache_read_cost_usd = (
+        (cache_read_tokens / usage_million) * cache_read_price_per_1m
+        if cache_read_price_per_1m is not None
+        else 0.0
+    )
+    cache_write_cost_usd = (
+        (cache_write_tokens / usage_million) * cache_write_price_per_1m
+        if cache_write_price_per_1m is not None
+        else 0.0
+    )
+    total_cost_usd = (
+        input_cost_usd + output_cost_usd + cache_read_cost_usd + cache_write_cost_usd
+    )
+    return {
+        "input_cost_usd": input_cost_usd,
+        "output_cost_usd": output_cost_usd,
+        "cache_read_cost_usd": cache_read_cost_usd,
+        "cache_write_cost_usd": cache_write_cost_usd,
+        "total_cost_usd": total_cost_usd,
+    }
+
+
+def attach_request_usage_and_cost(
+    result: Dict[str, Any],
+    args: argparse.Namespace,
+) -> None:
+    meta = result.get("_request_meta") if isinstance(result, dict) else None
+    if not isinstance(meta, dict):
+        return
+    usage = normalize_token_usage(meta.get("usage"))
+    if usage:
+        meta["usage"] = usage
+
+    provider_cost = _as_float(meta.get("provider_reported_cost_usd"))
+    estimated = (
+        estimate_token_cost_from_usage(
+            usage,
+            input_price_per_1m=args.input_price_per_1m,
+            output_price_per_1m=args.output_price_per_1m,
+            cache_read_price_per_1m=args.cache_read_price_per_1m,
+            cache_write_price_per_1m=args.cache_write_price_per_1m,
+        )
+        if usage
+        else None
+    )
+    if provider_cost is None and estimated is None:
+        return
+
+    total_cost_usd = (
+        provider_cost
+        if provider_cost is not None
+        else estimated["total_cost_usd"]
+        if estimated is not None
+        else None
+    )
+    model_cost: Dict[str, Any] = {
+        "source": "provider_reported" if provider_cost is not None else "estimated",
+        "provider_reported_cost_usd": provider_cost,
+        "estimated_cost_usd": estimated["total_cost_usd"] if estimated is not None else None,
+        "total_cost_usd": total_cost_usd,
+        "input_price_per_1m": args.input_price_per_1m,
+        "output_price_per_1m": args.output_price_per_1m,
+        "cache_read_price_per_1m": args.cache_read_price_per_1m,
+        "cache_write_price_per_1m": args.cache_write_price_per_1m,
+    }
+    if estimated is not None:
+        model_cost.update(
+            {
+                "input_cost_usd": estimated["input_cost_usd"],
+                "output_cost_usd": estimated["output_cost_usd"],
+                "cache_read_cost_usd": estimated["cache_read_cost_usd"],
+                "cache_write_cost_usd": estimated["cache_write_cost_usd"],
+            }
+        )
+    meta["model_cost"] = model_cost
 
 
 def format_request_flow_details(result: Dict[str, Any], *, wall_seconds: Optional[float] = None) -> str:
@@ -656,6 +960,11 @@ def format_request_flow_details(result: Dict[str, Any], *, wall_seconds: Optiona
     total_pages = meta.get("source_total_pages")
     endpoint = meta.get("endpoint")
     attempt = meta.get("attempt")
+    usage = normalize_token_usage(meta.get("usage"))
+    model_cost = meta.get("model_cost") if isinstance(meta.get("model_cost"), dict) else {}
+    total_cost_usd = _as_float(model_cost.get("total_cost_usd"))
+    if total_cost_usd is None:
+        total_cost_usd = _as_float(meta.get("provider_reported_cost_usd"))
     if prep is not None:
         parts.append(f"prep={prep:.2f}s")
     if req is not None:
@@ -671,6 +980,20 @@ def format_request_flow_details(result: Dict[str, Any], *, wall_seconds: Optiona
             parts.append(f"pages={pages}")
     if isinstance(attempt, int):
         parts.append(f"attempt={attempt}")
+    prompt_tokens = usage.get("prompt_tokens")
+    completion_tokens = usage.get("completion_tokens")
+    total_tokens = usage.get("total_tokens")
+    if prompt_tokens is not None or completion_tokens is not None or total_tokens is not None:
+        token_parts = []
+        if prompt_tokens is not None:
+            token_parts.append(f"in={prompt_tokens}")
+        if completion_tokens is not None:
+            token_parts.append(f"out={completion_tokens}")
+        if total_tokens is not None:
+            token_parts.append(f"total={total_tokens}")
+        parts.append("tokens(" + ", ".join(token_parts) + ")")
+    if total_cost_usd is not None:
+        parts.append(f"cost=${total_cost_usd:.6f}")
     if isinstance(endpoint, str) and endpoint:
         parts.append(f"endpoint={endpoint}")
     return " | ".join(parts) if parts else (f"wall={wall_seconds:.2f}s" if wall_seconds is not None else "timing=n/a")
@@ -889,6 +1212,14 @@ def build_config_metadata(args: argparse.Namespace, prompt_source: str) -> Dict[
         metadata["power_watts"] = args.power_watts
     if args.electric_rate is not None:
         metadata["electric_rate"] = args.electric_rate
+    if args.input_price_per_1m is not None:
+        metadata["input_price_per_1m"] = args.input_price_per_1m
+    if args.output_price_per_1m is not None:
+        metadata["output_price_per_1m"] = args.output_price_per_1m
+    if args.cache_read_price_per_1m is not None:
+        metadata["cache_read_price_per_1m"] = args.cache_read_price_per_1m
+    if args.cache_write_price_per_1m is not None:
+        metadata["cache_write_price_per_1m"] = args.cache_write_price_per_1m
     return metadata
 
 
@@ -1133,9 +1464,7 @@ def build_output_records(
     source_url = justice_source_url or local_source_url
     key_insights = normalize_text_list(ensure_list(result.get("key_insights")))
     tags = normalize_text_list(ensure_list(result.get("tags")))
-    power_mentions = normalize_text_list(
-        ensure_list(result.get("power_mentions")), strip_descriptor=True
-    )
+    power_mentions = normalize_power_mentions(ensure_list(result.get("power_mentions")))
     agency_involvement = normalize_agencies(
         normalize_text_list(ensure_list(result.get("agency_involvement")), strip_descriptor=True)
     )
@@ -1145,6 +1474,15 @@ def build_output_records(
         if args.include_action_items
         else []
     )
+    request_meta = result.get("_request_meta") if isinstance(result.get("_request_meta"), dict) else {}
+    token_usage = normalize_token_usage(request_meta.get("usage"))
+    model_cost = (
+        request_meta.get("model_cost")
+        if isinstance(request_meta.get("model_cost"), dict)
+        else {}
+    )
+    model_cost_total = _as_float(model_cost.get("total_cost_usd"))
+    model_cost_source = model_cost.get("source") if isinstance(model_cost.get("source"), str) else ""
 
     csv_row = {
         "source_id": source_id,
@@ -1167,6 +1505,13 @@ def build_output_records(
         "power_mentions": "; ".join(power_mentions),
         "agency_involvement": "; ".join(agency_involvement),
         "lead_types": "; ".join(lead_types),
+        "api_prompt_tokens": token_usage.get("prompt_tokens", ""),
+        "api_completion_tokens": token_usage.get("completion_tokens", ""),
+        "api_total_tokens": token_usage.get("total_tokens", ""),
+        "api_cache_read_tokens": token_usage.get("cache_read_tokens", ""),
+        "api_cache_write_tokens": token_usage.get("cache_write_tokens", ""),
+        "api_cost_usd": f"{model_cost_total:.8f}" if model_cost_total is not None else "",
+        "api_cost_source": model_cost_source,
     }
     if args.include_action_items:
         csv_row["action_items"] = "; ".join(action_items)
@@ -1189,6 +1534,13 @@ def build_output_records(
         "power_mentions": power_mentions,
         "agency_involvement": agency_involvement,
         "lead_types": lead_types,
+        "api_prompt_tokens": token_usage.get("prompt_tokens"),
+        "api_completion_tokens": token_usage.get("completion_tokens"),
+        "api_total_tokens": token_usage.get("total_tokens"),
+        "api_cache_read_tokens": token_usage.get("cache_read_tokens"),
+        "api_cache_write_tokens": token_usage.get("cache_write_tokens"),
+        "api_cost_usd": model_cost_total,
+        "api_cost_source": model_cost_source or None,
         "metadata": {
             "source_row_index": idx,
             "source_id": source_id,
@@ -1206,6 +1558,9 @@ def build_output_records(
             "processing_status": processing_status,
             "skip_reason": skip_reason,
             "text_quality": quality,
+            "request_meta": request_meta,
+            "token_usage": token_usage,
+            "model_cost": model_cost,
         },
     }
     if args.include_action_items:
@@ -1299,6 +1654,15 @@ def main() -> None:
         sys.exit("--image-max-side must be >= 0")
     if args.max_output_tokens < 1:
         sys.exit("--max-output-tokens must be >= 1")
+    for price_name in (
+        "input_price_per_1m",
+        "output_price_per_1m",
+        "cache_read_price_per_1m",
+        "cache_write_price_per_1m",
+    ):
+        price_value = getattr(args, price_name, None)
+        if price_value is not None and price_value < 0:
+            sys.exit(f"--{price_name.replace('_', '-')} must be >= 0")
     if active_processing_mode == "image" and args.api_format == "chat":
         sys.exit(
             "Image mode is not supported with --api-format chat. "
@@ -1380,6 +1744,20 @@ def main() -> None:
         f"Endpoint: {args.endpoint} | API format: {args.api_format} | Model: {args.model}",
         flush=True,
     )
+    if "openrouter.ai" in args.endpoint:
+        if args.input_price_per_1m is not None or args.output_price_per_1m is not None:
+            print(
+                "API token pricing enabled for cost tracking: "
+                f"input={args.input_price_per_1m}, output={args.output_price_per_1m}, "
+                f"cache_read={args.cache_read_price_per_1m}, cache_write={args.cache_write_price_per_1m}",
+                flush=True,
+            )
+        else:
+            print(
+                "OpenRouter endpoint detected with no explicit token pricing; "
+                "cost tracking will use provider-reported cost only (if present).",
+                flush=True,
+            )
 
     fieldnames = [
         "source_id",
@@ -1402,6 +1780,13 @@ def main() -> None:
         "power_mentions",
         "agency_involvement",
         "lead_types",
+        "api_prompt_tokens",
+        "api_completion_tokens",
+        "api_total_tokens",
+        "api_cache_read_tokens",
+        "api_cache_write_tokens",
+        "api_cost_usd",
+        "api_cost_source",
     ]
     if args.include_action_items:
         fieldnames.append("action_items")
@@ -1507,6 +1892,16 @@ def main() -> None:
     skipped = 0
     failed = 0
     model_scored = 0
+    api_rows_with_usage = 0
+    api_prompt_tokens_total = 0
+    api_completion_tokens_total = 0
+    api_total_tokens_total = 0
+    api_cache_read_tokens_total = 0
+    api_cache_write_tokens_total = 0
+    api_cost_usd_total = 0.0
+    api_rows_with_cost = 0
+    eta_completed = 0
+    eta_completion_times: Deque[float] = deque(maxlen=max(32, args.max_parallel_requests * 20))
     interrupted = False
     request_semaphore: Optional[threading.Semaphore] = None
     if max_in_flight_tasks > 1:
@@ -1516,6 +1911,35 @@ def main() -> None:
         if max_in_flight_tasks > 1
         else None
     )
+
+    def record_completion_for_eta(result: Optional[Dict[str, Any]] = None) -> None:
+        nonlocal eta_completed
+        nonlocal api_rows_with_usage, api_prompt_tokens_total, api_completion_tokens_total
+        nonlocal api_total_tokens_total, api_cache_read_tokens_total, api_cache_write_tokens_total
+        nonlocal api_cost_usd_total, api_rows_with_cost
+        eta_completed += 1
+        eta_completion_times.append(time.monotonic())
+        if not isinstance(result, dict):
+            return
+        request_meta = (
+            result.get("_request_meta")
+            if isinstance(result.get("_request_meta"), dict)
+            else {}
+        )
+        usage = normalize_token_usage(request_meta.get("usage"))
+        if usage:
+            api_rows_with_usage += 1
+            api_prompt_tokens_total += usage.get("prompt_tokens", 0)
+            api_completion_tokens_total += usage.get("completion_tokens", 0)
+            api_total_tokens_total += usage.get("total_tokens", 0)
+            api_cache_read_tokens_total += usage.get("cache_read_tokens", 0)
+            api_cache_write_tokens_total += usage.get("cache_write_tokens", 0)
+        model_cost = request_meta.get("model_cost")
+        if isinstance(model_cost, dict):
+            row_cost_usd = _as_float(model_cost.get("total_cost_usd"))
+            if row_cost_usd is not None:
+                api_rows_with_cost += 1
+                api_cost_usd_total += row_cost_usd
 
     def flush_ready() -> None:
         nonlocal processed, skipped, failed, model_scored
@@ -1582,6 +2006,8 @@ def main() -> None:
             )
             try:
                 result = future.result()
+                attach_request_usage_and_cost(result, args)
+                record_completion_for_eta(result)
                 if args.flow_logs:
                     print(
                         f"[Row {row_idx}] [done] {row_source_id(row)} | "
@@ -1598,6 +2024,7 @@ def main() -> None:
                     "skip_reason": "",
                 }
             except Exception as exc:  # noqa: BLE001
+                record_completion_for_eta()
                 if args.flow_logs:
                     duration = f"{wall_seconds:.2f}s" if wall_seconds is not None else "n/a"
                     print(
@@ -1661,6 +2088,7 @@ def main() -> None:
                 skip_reason = None
             if skip_reason:
                 print(f"[Row {idx}] [skip] {source_id}: {skip_reason}", flush=True)
+                record_completion_for_eta()
                 pending_results[idx] = {
                     "type": "record",
                     "row": row,
@@ -1681,10 +2109,12 @@ def main() -> None:
 
             eta_text = format_eta(
                 start_time,
-                processed,
+                eta_completed,
                 target_total,
                 args.power_watts,
                 args.electric_rate,
+                api_cost_usd_total if api_rows_with_cost > 0 else None,
+                eta_completion_times,
             )
             display_name = row.get("document_part") or filename
             print(f"{progress_prefix} Processing {display_name}... {eta_text}", flush=True)
@@ -1741,6 +2171,8 @@ def main() -> None:
                 try:
                     sync_started = time.monotonic()
                     result = call_model(**request_kwargs)
+                    attach_request_usage_and_cost(result, args)
+                    record_completion_for_eta(result)
                     if args.flow_logs:
                         print(
                             f"[Row {idx}] [done] {source_id} | "
@@ -1757,6 +2189,7 @@ def main() -> None:
                         "skip_reason": "",
                     }
                 except Exception as exc:  # noqa: BLE001
+                    record_completion_for_eta()
                     pending_results[idx] = {
                         "type": "error",
                         "row": row,
@@ -1869,6 +2302,24 @@ def main() -> None:
         complete_msg = (
             f"{complete_msg}\nResume by re-running with --resume "
             f"(checkpoint: {args.checkpoint})."
+        )
+    if api_rows_with_usage > 0:
+        token_summary = (
+            "Token usage "
+            f"(rows with usage: {api_rows_with_usage}): "
+            f"in={api_prompt_tokens_total}, out={api_completion_tokens_total}, total={api_total_tokens_total}"
+        )
+        if api_cache_read_tokens_total > 0 or api_cache_write_tokens_total > 0:
+            token_summary += (
+                f", cache_read={api_cache_read_tokens_total}, "
+                f"cache_write={api_cache_write_tokens_total}"
+            )
+        complete_msg = f"{complete_msg}\n{token_summary}"
+    if api_rows_with_cost > 0:
+        avg_cost = api_cost_usd_total / max(api_rows_with_cost, 1)
+        complete_msg = (
+            f"{complete_msg}\nModel API cost: ${api_cost_usd_total:.6f} "
+            f"(rows with cost: {api_rows_with_cost}, avg ${avg_cost:.6f}/row)"
         )
     if cost_summary:
         complete_msg = f"{complete_msg}\n{cost_summary}"

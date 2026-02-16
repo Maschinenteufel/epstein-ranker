@@ -59,6 +59,13 @@ electric_rate = 0.25
 # Optionally provide expected hours if you want cost estimates independent of wall time.
 # run_hours = 60.0
 
+# Optional hosted model token pricing for API cost tracking (USD per 1M tokens).
+# Set these for OpenRouter/cloud runs so per-row + total API costs are recorded.
+# input_price_per_1m = 0.13
+# output_price_per_1m = 0.52
+# cache_read_price_per_1m = 0.0
+# cache_write_price_per_1m = 0.0
+
 # Paths
 input = "data/new_data/VOL00001"
 input_glob = "*.pdf"  # Used when input is a directory

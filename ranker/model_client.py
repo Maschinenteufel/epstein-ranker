@@ -592,6 +592,158 @@ def ensure_json_dict(content: str) -> Dict[str, Any]:
     return parsed
 
 
+def _coerce_int(value: Any) -> Optional[int]:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return max(0, value)
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return None
+        return max(0, int(round(value)))
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        try:
+            return max(0, int(stripped))
+        except ValueError:
+            try:
+                parsed = float(stripped)
+            except ValueError:
+                return None
+            if math.isnan(parsed) or math.isinf(parsed):
+                return None
+            return max(0, int(round(parsed)))
+    return None
+
+
+def _coerce_float(value: Any) -> Optional[float]:
+    if isinstance(value, bool):
+        return float(value)
+    if isinstance(value, (int, float)):
+        parsed = float(value)
+        if math.isnan(parsed) or math.isinf(parsed):
+            return None
+        return parsed
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        try:
+            parsed = float(stripped)
+        except ValueError:
+            return None
+        if math.isnan(parsed) or math.isinf(parsed):
+            return None
+        return parsed
+    return None
+
+
+def _pick_int(data: Dict[str, Any], keys: List[str]) -> Optional[int]:
+    for key in keys:
+        if key in data:
+            value = _coerce_int(data.get(key))
+            if value is not None:
+                return value
+    return None
+
+
+def _pick_float(data: Dict[str, Any], keys: List[str]) -> Optional[float]:
+    for key in keys:
+        if key in data:
+            value = _coerce_float(data.get(key))
+            if value is not None:
+                return value
+    return None
+
+
+def _first_not_none(values: List[Optional[Any]]) -> Optional[Any]:
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def extract_response_usage(data: Dict[str, Any]) -> Tuple[Dict[str, int], Optional[float]]:
+    usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+    prompt_details = (
+        usage.get("prompt_tokens_details")
+        if isinstance(usage.get("prompt_tokens_details"), dict)
+        else {}
+    )
+    completion_details = (
+        usage.get("completion_tokens_details")
+        if isinstance(usage.get("completion_tokens_details"), dict)
+        else {}
+    )
+
+    prompt_tokens = _pick_int(usage, ["prompt_tokens", "input_tokens"])
+    completion_tokens = _pick_int(usage, ["completion_tokens", "output_tokens"])
+    total_tokens = _pick_int(usage, ["total_tokens"])
+    if total_tokens is None:
+        total_tokens = _pick_int(data, ["total_tokens"])
+    cache_read_tokens = _first_not_none(
+        [
+            _pick_int(
+                usage,
+                ["cache_read_tokens", "cache_read_input_tokens", "cached_tokens"],
+            ),
+            _pick_int(
+                prompt_details,
+                ["cache_read_tokens", "cache_read_input_tokens", "cached_tokens"],
+            ),
+            _pick_int(
+                completion_details,
+                ["cache_read_tokens", "cache_read_input_tokens", "cached_tokens"],
+            ),
+        ]
+    )
+    cache_write_tokens = _first_not_none(
+        [
+            _pick_int(
+                usage,
+                ["cache_write_tokens", "cache_creation_input_tokens", "cache_creation_tokens"],
+            ),
+            _pick_int(
+                prompt_details,
+                ["cache_write_tokens", "cache_creation_input_tokens", "cache_creation_tokens"],
+            ),
+            _pick_int(
+                completion_details,
+                ["cache_write_tokens", "cache_creation_input_tokens", "cache_creation_tokens"],
+            ),
+        ]
+    )
+
+    if total_tokens is None and prompt_tokens is not None and completion_tokens is not None:
+        total_tokens = prompt_tokens + completion_tokens
+    if prompt_tokens is None and total_tokens is not None and completion_tokens is not None:
+        prompt_tokens = max(total_tokens - completion_tokens, 0)
+    if completion_tokens is None and total_tokens is not None and prompt_tokens is not None:
+        completion_tokens = max(total_tokens - prompt_tokens, 0)
+
+    normalized_usage: Dict[str, int] = {}
+    if prompt_tokens is not None:
+        normalized_usage["prompt_tokens"] = prompt_tokens
+    if completion_tokens is not None:
+        normalized_usage["completion_tokens"] = completion_tokens
+    if total_tokens is not None:
+        normalized_usage["total_tokens"] = total_tokens
+    if cache_read_tokens is not None:
+        normalized_usage["cache_read_tokens"] = cache_read_tokens
+    if cache_write_tokens is not None:
+        normalized_usage["cache_write_tokens"] = cache_write_tokens
+
+    provider_reported_cost_usd = _first_not_none(
+        [
+            _pick_float(data, ["cost", "total_cost", "usage_cost"]),
+            _pick_float(usage, ["cost", "total_cost", "usage_cost"]),
+        ]
+    )
+    return normalized_usage, provider_reported_cost_usd
+
+
 def call_model(
     *,
     endpoint: str,
@@ -729,6 +881,7 @@ def call_model(
                     request_started = time.monotonic()
                     data = send_request(url=f"{base_url}/chat/completions", payload=payload)
                     request_seconds = time.monotonic() - request_started
+                    usage, provider_reported_cost_usd = extract_response_usage(data)
                     content = extract_openai_content(data)
                 else:
                     payload = {
@@ -739,6 +892,7 @@ def call_model(
                     request_started = time.monotonic()
                     data = send_request(url=f"{base_url}/chat", payload=payload)
                     request_seconds = time.monotonic() - request_started
+                    usage, provider_reported_cost_usd = extract_response_usage(data)
                     content = extract_chat_content(data)
                 try:
                     parsed = ensure_json_dict(content)
@@ -752,6 +906,8 @@ def call_model(
                         "image_blocks": len(image_urls) if input_kind == "image" else 0,
                         "source_page_count": source_page_count,
                         "source_total_pages": source_total_pages,
+                        "usage": usage,
+                        "provider_reported_cost_usd": provider_reported_cost_usd,
                     }
                     return parsed
                 except (json.JSONDecodeError, TypeError, ValueError) as exc:

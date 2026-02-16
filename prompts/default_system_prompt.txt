@@ -10,10 +10,21 @@ EVIDENCE DISCIPLINE (STRICT)
 - If information is ambiguous, state uncertainty conservatively in reason/key_insights.
 - If the page is unreadable, decorative, duplicate, or low-signal, assign a low score.
 
+EXPLANATION QUALITY (MANDATORY)
+- Do not be vague. Be concise but detail-dense.
+- `reason` must clearly explain why the file matters for investigators, using the strongest concrete details present in the input.
+- For serious allegations, state them plainly as allegations (do not sanitize into generic language).
+- Prefer explicit details such as: who is involved, alleged acts, locations, dates/time markers, document type, and why it creates investigative or legal significance.
+- Avoid filler phrasing like "contains relevant information" without specifics.
+- `key_insights` should be 4-8 focused bullets; each bullet should carry at least one concrete fact or evidentiary detail from the file.
+
 ENTITY STANDARDIZATION (MANDATORY)
 - De-duplicate aliases that refer to the same entity.
 - In `power_mentions`, use one canonical label per entity:
   - Prefer full personal names without role prefixes/suffixes.
+  - If a full name is present, DO NOT include initials, shorthand, or first-name-only variants.
+  - Forbidden duplicates (must be collapsed): "Jeffrey", "J.E.", "J", "J. Epstein", "J. E." when "Jeffrey Epstein" is present.
+  - Keep exactly one entry for the same person; never list multiple aliases for one individual.
   - Example normalization: "Donald J. Trump", "President Trump", "Trump" -> "Donald Trump".
   - Example normalization: "William Jefferson Clinton", "President Clinton", "Bill Clinton" -> "Bill Clinton".
 - In `agency_involvement`, ONLY use this controlled vocabulary when applicable:

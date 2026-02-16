@@ -1,19 +1,19 @@
 {
   "metadata": {
     "total_dataset_rows": "unknown",
-    "rows_processed": 225,
-    "last_updated": "2026-02-15 20:59:27"
+    "rows_processed": 428,
+    "last_updated": "2026-02-15 22:21:53"
   },
   "chunks": [
     {
       "start_row": 1,
       "end_row": 1000,
-      "json": "contrib/fta/VOL00001/epstein_ranked_00001_01000.jsonl"
+      "json": "/Users/linovaldovinos/Documents/LatentPlayground/EpstineFileRanker/EpsteinFileRanker-deploy/source/contrib/fta/VOL00001/epstein_ranked_00001_01000.jsonl"
     },
     {
       "start_row": 1,
       "end_row": 1000,
-      "json": "contrib/fta/VOL00003/epstein_ranked_00001_01000.jsonl"
+      "json": "/Users/linovaldovinos/Documents/LatentPlayground/EpstineFileRanker/EpsteinFileRanker-deploy/source/contrib/fta/VOL00003/epstein_ranked_00001_01000.jsonl"
     }
   ]
 }

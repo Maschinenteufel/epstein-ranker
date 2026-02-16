@@ -59,6 +59,15 @@ TEMPERATURE=0.0
 SLEEP_SECONDS=0
 CHUNK_SIZE=1000
 MAX_ROWS=""
+INPUT_PRICE_PER_1M="${INPUT_PRICE_PER_1M:-}"
+OUTPUT_PRICE_PER_1M="${OUTPUT_PRICE_PER_1M:-}"
+CACHE_READ_PRICE_PER_1M="${CACHE_READ_PRICE_PER_1M:-}"
+CACHE_WRITE_PRICE_PER_1M="${CACHE_WRITE_PRICE_PER_1M:-}"
+PRICE_EXPLICIT=0
+OPENROUTER_DEFAULT_INPUT_PRICE_PER_1M="${OPENROUTER_DEFAULT_INPUT_PRICE_PER_1M:-0.13}"
+OPENROUTER_DEFAULT_OUTPUT_PRICE_PER_1M="${OPENROUTER_DEFAULT_OUTPUT_PRICE_PER_1M:-0.52}"
+OPENROUTER_DEFAULT_CACHE_READ_PRICE_PER_1M="${OPENROUTER_DEFAULT_CACHE_READ_PRICE_PER_1M:-}"
+OPENROUTER_DEFAULT_CACHE_WRITE_PRICE_PER_1M="${OPENROUTER_DEFAULT_CACHE_WRITE_PRICE_PER_1M:-}"
 
 RESUME=1
 SKIP_MISSING=1
@@ -111,6 +120,10 @@ Model/runtime options:
   --no-flow-logs             Disable per-row flow logs
   --max-output-tokens N      Max completion tokens per request (default: 900)
   --temperature FLOAT        Sampling temperature (default: 0.0)
+  --input-price-per-1m USD   Input token price (USD per 1M tokens) for cost tracking
+  --output-price-per-1m USD  Output token price (USD per 1M tokens) for cost tracking
+  --cache-read-price-per-1m  Cache-read token price (USD per 1M tokens)
+  --cache-write-price-per-1m Cache-write token price (USD per 1M tokens)
   --sleep SECONDS            Delay between submissions (default: 0)
   --chunk-size N             Output chunk size (default: 1000)
   --max-rows N               Limit rows for smoke test per volume
@@ -394,6 +407,26 @@ while [[ $# -gt 0 ]]; do
       TEMPERATURE="$2"
       shift 2
       ;;
+    --input-price-per-1m)
+      INPUT_PRICE_PER_1M="$2"
+      PRICE_EXPLICIT=1
+      shift 2
+      ;;
+    --output-price-per-1m)
+      OUTPUT_PRICE_PER_1M="$2"
+      PRICE_EXPLICIT=1
+      shift 2
+      ;;
+    --cache-read-price-per-1m)
+      CACHE_READ_PRICE_PER_1M="$2"
+      PRICE_EXPLICIT=1
+      shift 2
+      ;;
+    --cache-write-price-per-1m)
+      CACHE_WRITE_PRICE_PER_1M="$2"
+      PRICE_EXPLICIT=1
+      shift 2
+      ;;
     --sleep)
       SLEEP_SECONDS="$2"
       shift 2
@@ -501,6 +534,12 @@ if [[ "$PROVIDER" == "openrouter" ]]; then
   if (( IMAGE_PREFETCH_EXPLICIT == 0 )); then
     IMAGE_PREFETCH="$MAX_PARALLEL_REQUESTS"
   fi
+  if (( PRICE_EXPLICIT == 0 )); then
+    INPUT_PRICE_PER_1M="$OPENROUTER_DEFAULT_INPUT_PRICE_PER_1M"
+    OUTPUT_PRICE_PER_1M="$OPENROUTER_DEFAULT_OUTPUT_PRICE_PER_1M"
+    CACHE_READ_PRICE_PER_1M="$OPENROUTER_DEFAULT_CACHE_READ_PRICE_PER_1M"
+    CACHE_WRITE_PRICE_PER_1M="$OPENROUTER_DEFAULT_CACHE_WRITE_PRICE_PER_1M"
+  fi
 fi
 
 VOLUMES=()
@@ -518,6 +557,9 @@ echo "Workspace root: $WORKSPACE_ROOT"
 echo "Provider: $PROVIDER"
 echo "Model: $MODEL"
 echo "Endpoint: $ENDPOINT"
+if [[ -n "$INPUT_PRICE_PER_1M" || -n "$OUTPUT_PRICE_PER_1M" || -n "$CACHE_READ_PRICE_PER_1M" || -n "$CACHE_WRITE_PRICE_PER_1M" ]]; then
+  echo "Token pricing (USD / 1M): input=${INPUT_PRICE_PER_1M:-unset}, output=${OUTPUT_PRICE_PER_1M:-unset}, cache_read=${CACHE_READ_PRICE_PER_1M:-unset}, cache_write=${CACHE_WRITE_PRICE_PER_1M:-unset}"
+fi
 
 for vol in "${VOLUMES[@]}"; do
   VOL_DIR="$(printf "%s/VOL%05d" "$DATA_ROOT" "$vol")"
@@ -591,6 +633,18 @@ for vol in "${VOLUMES[@]}"; do
   fi
   if [[ -n "$MAX_ROWS" ]]; then
     CMD+=(--max-rows "$MAX_ROWS")
+  fi
+  if [[ -n "$INPUT_PRICE_PER_1M" ]]; then
+    CMD+=(--input-price-per-1m "$INPUT_PRICE_PER_1M")
+  fi
+  if [[ -n "$OUTPUT_PRICE_PER_1M" ]]; then
+    CMD+=(--output-price-per-1m "$OUTPUT_PRICE_PER_1M")
+  fi
+  if [[ -n "$CACHE_READ_PRICE_PER_1M" ]]; then
+    CMD+=(--cache-read-price-per-1m "$CACHE_READ_PRICE_PER_1M")
+  fi
+  if [[ -n "$CACHE_WRITE_PRICE_PER_1M" ]]; then
+    CMD+=(--cache-write-price-per-1m "$CACHE_WRITE_PRICE_PER_1M")
   fi
   if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
     CMD+=("${EXTRA_ARGS[@]}")

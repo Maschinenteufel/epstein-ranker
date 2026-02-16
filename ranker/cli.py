@@ -521,6 +521,42 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override elapsed hours for cost estimate (otherwise uses wall time).",
     )
+    parser.add_argument(
+        "--input-price-per-1m",
+        type=float,
+        default=None,
+        help=(
+            "Optional API input token price in USD per 1M tokens "
+            "(used for model cost tracking)."
+        ),
+    )
+    parser.add_argument(
+        "--output-price-per-1m",
+        type=float,
+        default=None,
+        help=(
+            "Optional API output token price in USD per 1M tokens "
+            "(used for model cost tracking)."
+        ),
+    )
+    parser.add_argument(
+        "--cache-read-price-per-1m",
+        type=float,
+        default=None,
+        help=(
+            "Optional API cache-read token price in USD per 1M tokens. "
+            "When set, cached input tokens are priced separately from normal input tokens."
+        ),
+    )
+    parser.add_argument(
+        "--cache-write-price-per-1m",
+        type=float,
+        default=None,
+        help=(
+            "Optional API cache-write token price in USD per 1M tokens. "
+            "When set, cache creation tokens are priced separately from normal input tokens."
+        ),
+    )
     args = parser.parse_args()
     cli_explicit = explicit_cli_destinations(sys.argv[1:])
     config_path = None

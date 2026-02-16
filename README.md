@@ -98,6 +98,13 @@ OPENROUTER_TITLE='Epstein File Ranker'
 
 `run_ranker.sh` auto-loads `.env.openrouter` (or `OPENROUTER_ENV_FILE=/custom/path`), and this file is git-ignored by default.
 
+For `--provider openrouter`, `run_ranker.sh` now auto-applies token pricing defaults for `qwen/qwen3-vl-30b-a3b-instruct`:
+- input: `$0.13 / 1M`
+- output: `$0.52 / 1M`
+
+Override at runtime with:
+`--input-price-per-1m`, `--output-price-per-1m`, `--cache-read-price-per-1m`, `--cache-write-price-per-1m`.
+
 `run_ranker.sh` automatically:
 
 - Resolves selected volumes (`1`, `1,2,6-7`, or `all`).
@@ -171,6 +178,7 @@ Notable flags:
 - `--chunk-size`, `--chunk-dir`, `--chunk-manifest`: control chunk splitting, where chunk files live, and where the manifest is written.
 - `--overwrite-output`: explicitly allow truncating existing files (default is to refuse unless `--resume` or unique paths are used).
 - `--power-watts`, `--electric-rate`, `--run-hours`: plug in your local power draw/cost to estimate total electricity usage (also configurable via the TOML file).
+- `--input-price-per-1m`, `--output-price-per-1m`, `--cache-read-price-per-1m`, `--cache-write-price-per-1m`: track hosted API model costs from reported token usage.
 - `run_ranker.sh --workspace-chunks`: keep chunks inside ignored workspace paths instead of `contrib/fta/` if you do not want Git-tracked outputs.
 
 Pause/resume behavior:
@@ -186,6 +194,7 @@ Outputs:
 - `contrib/epstein_ranked_<start>_<end>.jsonl` + `data/chunks.json` – Default chunk outputs/manifest for direct CLI runs without workspace mode.
 - `data/epstein_ranked.csv/jsonl` – Only produced if you disable chunking via `--chunk-size 0`.
 - `data/workspaces/<dataset-tag>/metadata/run_metadata.json` – Optional run provenance sidecar (enabled automatically in workspace mode).
+- Output rows now include API usage/cost fields (`api_prompt_tokens`, `api_completion_tokens`, `api_total_tokens`, cache token fields, `api_cost_usd`) when the provider returns usage data.
 
 ### Independent Corpus Workspace
 
