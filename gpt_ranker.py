@@ -644,6 +644,38 @@ def format_eta(
     return eta_msg
 
 
+def format_request_flow_details(result: Dict[str, Any], *, wall_seconds: Optional[float] = None) -> str:
+    meta = result.get("_request_meta") if isinstance(result, dict) else None
+    if not isinstance(meta, dict):
+        return f"wall={wall_seconds:.2f}s" if wall_seconds is not None else "timing=n/a"
+    parts: List[str] = []
+    prep = meta.get("prep_seconds")
+    req = meta.get("request_seconds")
+    blocks = meta.get("image_blocks")
+    pages = meta.get("source_page_count")
+    total_pages = meta.get("source_total_pages")
+    endpoint = meta.get("endpoint")
+    attempt = meta.get("attempt")
+    if prep is not None:
+        parts.append(f"prep={prep:.2f}s")
+    if req is not None:
+        parts.append(f"request={req:.2f}s")
+    if wall_seconds is not None:
+        parts.append(f"wall={wall_seconds:.2f}s")
+    if isinstance(blocks, int) and blocks > 0:
+        parts.append(f"blocks={blocks}")
+    if isinstance(pages, int) and pages > 0:
+        if isinstance(total_pages, int) and total_pages > 0:
+            parts.append(f"pages={pages}/{total_pages}")
+        else:
+            parts.append(f"pages={pages}")
+    if isinstance(attempt, int):
+        parts.append(f"attempt={attempt}")
+    if isinstance(endpoint, str) and endpoint:
+        parts.append(f"endpoint={endpoint}")
+    return " | ".join(parts) if parts else (f"wall={wall_seconds:.2f}s" if wall_seconds is not None else "timing=n/a")
+
+
 class OutputRouter:
     def __init__(self, args: argparse.Namespace, fieldnames: List[str]):
         self.args = args
@@ -827,6 +859,7 @@ def build_config_metadata(args: argparse.Namespace, prompt_source: str) -> Dict[
         "image_jpeg_quality": args.image_jpeg_quality,
         "image_max_side": args.image_max_side,
         "debug_image_dir": str(args.debug_image_dir) if args.debug_image_dir else None,
+        "flow_logs": args.flow_logs,
         "prompt_source": prompt_source,
     }
     if args.dataset_tag:
@@ -1465,6 +1498,8 @@ def main() -> None:
             f"{args.max_parallel_requests} concurrent request(s) + "
             f"{args.image_prefetch} queued prefetch task(s)."
         )
+    if args.flow_logs:
+        print("Flow logs enabled: emitting queue/prep/request timing per row.", flush=True)
     emit_order: Deque[int] = deque()
     pending_results: Dict[int, Dict[str, Any]] = {}
     in_flight: Dict[concurrent.futures.Future[Dict[str, Any]], Dict[str, Any]] = {}
@@ -1539,8 +1574,21 @@ def main() -> None:
             row_idx = context["idx"]
             row = context["row"]
             quality = context["quality"]
+            started_at = context.get("submitted_at")
+            wall_seconds = (
+                max(0.0, time.monotonic() - started_at)
+                if isinstance(started_at, (int, float))
+                else None
+            )
             try:
                 result = future.result()
+                if args.flow_logs:
+                    print(
+                        f"[Row {row_idx}] [done] {row_source_id(row)} | "
+                        f"{format_request_flow_details(result, wall_seconds=wall_seconds)} | "
+                        f"in_flight={len(in_flight)}",
+                        flush=True,
+                    )
                 pending_results[row_idx] = {
                     "type": "record",
                     "row": row,
@@ -1550,6 +1598,13 @@ def main() -> None:
                     "skip_reason": "",
                 }
             except Exception as exc:  # noqa: BLE001
+                if args.flow_logs:
+                    duration = f"{wall_seconds:.2f}s" if wall_seconds is not None else "n/a"
+                    print(
+                        f"[Row {row_idx}] [error] {row_source_id(row)} | wall={duration} | "
+                        f"in_flight={len(in_flight)} | {exc}",
+                        flush=True,
+                    )
                 pending_results[row_idx] = {
                     "type": "error",
                     "row": row,
@@ -1684,7 +1739,15 @@ def main() -> None:
 
             if executor is None:
                 try:
+                    sync_started = time.monotonic()
                     result = call_model(**request_kwargs)
+                    if args.flow_logs:
+                        print(
+                            f"[Row {idx}] [done] {source_id} | "
+                            f"{format_request_flow_details(result, wall_seconds=time.monotonic() - sync_started)} | "
+                            "in_flight=0",
+                            flush=True,
+                        )
                     pending_results[idx] = {
                         "type": "record",
                         "row": row,
@@ -1704,6 +1767,12 @@ def main() -> None:
                 if parallel_scheduling == "window":
                     while len(in_flight) >= max_in_flight_tasks:
                         harvest_completed(block=True)
+                if args.flow_logs:
+                    print(
+                        f"[Row {idx}] [queue] submit {source_id} | "
+                        f"slot={len(in_flight)+1}/{max_in_flight_tasks}",
+                        flush=True,
+                    )
                 future = executor.submit(
                     call_model,
                     endpoint=args.endpoint,
@@ -1741,7 +1810,12 @@ def main() -> None:
                     x_title=args.x_title,
                     config_metadata=config_metadata,
                 )
-                in_flight[future] = {"idx": idx, "row": row, "quality": quality}
+                in_flight[future] = {
+                    "idx": idx,
+                    "row": row,
+                    "quality": quality,
+                    "submitted_at": time.monotonic(),
+                }
                 if parallel_scheduling == "window":
                     harvest_completed(block=False)
                 elif len(in_flight) >= args.max_parallel_requests:

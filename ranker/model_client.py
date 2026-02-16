@@ -647,7 +647,11 @@ def call_model(
         extra_headers["X-Title"] = x_title
     doc_input = build_text_analysis_input(filename, text)
     image_urls: List[str] = []
+    prep_seconds: Optional[float] = None
+    source_page_count: Optional[int] = None
+    source_total_pages: Optional[int] = None
     if input_kind == "image" and image_path is not None:
+        prep_start = time.monotonic()
         image_urls, source_page_count, source_total_pages = prepare_image_data_urls(
             image_path,
             max_pages=max(1, image_max_pages),
@@ -659,6 +663,7 @@ def call_model(
             debug_image_dir=debug_image_dir,
             start_page=max(1, image_start_page),
         )
+        prep_seconds = time.monotonic() - prep_start
         doc_input = build_image_analysis_instruction(
             filename,
             source_page_count,
@@ -721,7 +726,9 @@ def call_model(
                         payload["reasoning"] = {"effort": reasoning_effort}
                     if config_metadata:
                         payload["metadata"] = config_metadata
+                    request_started = time.monotonic()
                     data = send_request(url=f"{base_url}/chat/completions", payload=payload)
+                    request_seconds = time.monotonic() - request_started
                     content = extract_openai_content(data)
                 else:
                     payload = {
@@ -729,10 +736,24 @@ def call_model(
                         "system_prompt": system_prompt,
                         "input": doc_input,
                     }
+                    request_started = time.monotonic()
                     data = send_request(url=f"{base_url}/chat", payload=payload)
+                    request_seconds = time.monotonic() - request_started
                     content = extract_chat_content(data)
                 try:
-                    return ensure_json_dict(content)
+                    parsed = ensure_json_dict(content)
+                    parsed["_request_meta"] = {
+                        "mode": mode,
+                        "endpoint": base_url,
+                        "attempt": attempt,
+                        "request_seconds": round(request_seconds, 4),
+                        "prep_seconds": round(prep_seconds, 4) if prep_seconds is not None else None,
+                        "input_kind": input_kind,
+                        "image_blocks": len(image_urls) if input_kind == "image" else 0,
+                        "source_page_count": source_page_count,
+                        "source_total_pages": source_total_pages,
+                    }
+                    return parsed
                 except (json.JSONDecodeError, TypeError, ValueError) as exc:
                     raise ModelRequestError(
                         f"Invalid JSON model output from {base_url}: {exc}",

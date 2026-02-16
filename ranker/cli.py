@@ -412,6 +412,15 @@ def parse_args() -> argparse.Namespace:
         help="Optional directory to save intermediate rendered/packed images and prep timing summaries.",
     )
     parser.add_argument(
+        "--flow-logs",
+        action="store_true",
+        default=False,
+        help=(
+            "Emit per-row flow logs (queue/prep/request timings) to help confirm parallel behavior "
+            "and identify preprocessing bottlenecks."
+        ),
+    )
+    parser.add_argument(
         "--max-retries",
         type=int,
         default=3,

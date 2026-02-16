@@ -53,6 +53,7 @@ IMAGE_OUTPUT_FORMAT="jpeg"
 IMAGE_JPEG_QUALITY=75
 IMAGE_MAX_SIDE=1024
 DEBUG_IMAGE_DIR=""
+FLOW_LOGS=1
 MAX_OUTPUT_TOKENS=900
 TEMPERATURE=0.0
 SLEEP_SECONDS=0
@@ -106,6 +107,8 @@ Model/runtime options:
   --image-jpeg-quality N     JPEG quality for prepared images (default: 75)
   --image-max-side N         Downscale long side to this px (0 disables, default: 1024)
   --debug-image-dir PATH     Save intermediate rendered/packed images + timing JSONs
+  --flow-logs                Enable per-row queue/prep/request timing logs (default)
+  --no-flow-logs             Disable per-row flow logs
   --max-output-tokens N      Max completion tokens per request (default: 900)
   --temperature FLOAT        Sampling temperature (default: 0.0)
   --sleep SECONDS            Delay between submissions (default: 0)
@@ -375,6 +378,14 @@ while [[ $# -gt 0 ]]; do
       DEBUG_IMAGE_DIR="$2"
       shift 2
       ;;
+    --flow-logs)
+      FLOW_LOGS=1
+      shift
+      ;;
+    --no-flow-logs)
+      FLOW_LOGS=0
+      shift
+      ;;
     --max-output-tokens)
       MAX_OUTPUT_TOKENS="$2"
       shift 2
@@ -554,6 +565,9 @@ for vol in "${VOLUMES[@]}"; do
   )
   if [[ -n "$DEBUG_IMAGE_DIR" ]]; then
     CMD+=(--debug-image-dir "$DEBUG_IMAGE_DIR")
+  fi
+  if (( FLOW_LOGS )); then
+    CMD+=(--flow-logs)
   fi
 
   if (( TRACK_CHUNKS_IN_GIT )); then
