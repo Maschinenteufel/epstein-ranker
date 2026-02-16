@@ -222,6 +222,12 @@ def parse_args() -> argparse.Namespace:
         help="Temperature for model responses (0.0 = deterministic, higher = more random).",
     )
     parser.add_argument(
+        "--max-output-tokens",
+        type=int,
+        default=900,
+        help="Upper bound for model completion tokens per request.",
+    )
+    parser.add_argument(
         "--prompt-file",
         type=Path,
         default=None,
@@ -328,6 +334,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=180,
         help="DPI used for PDF page rendering before multimodal inference.",
+    )
+    parser.add_argument(
+        "--image-detail",
+        choices=["auto", "low", "high"],
+        default="low",
+        help="Vision detail hint passed to image_url blocks (lower detail reduces token usage).",
     )
     parser.add_argument(
         "--max-retries",

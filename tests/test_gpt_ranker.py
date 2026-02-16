@@ -285,7 +285,9 @@ class GptRankerHelpersTest(unittest.TestCase):
                 max_retries=1,
                 retry_backoff=0,
                 temperature=0.0,
+                max_output_tokens=900,
                 reasoning_effort=None,
+                image_detail="low",
                 config_metadata=None,
             )
         self.assertEqual(result["headline"], "h")
@@ -327,7 +329,9 @@ class GptRankerHelpersTest(unittest.TestCase):
                 max_retries=1,
                 retry_backoff=0,
                 temperature=0.0,
+                max_output_tokens=900,
                 reasoning_effort=None,
+                image_detail="low",
                 config_metadata=None,
             )
         self.assertEqual(result["importance_score"], 1)
@@ -369,7 +373,55 @@ class GptRankerHelpersTest(unittest.TestCase):
                 max_retries=2,
                 retry_backoff=0,
                 temperature=0.0,
+                max_output_tokens=900,
                 reasoning_effort=None,
+                image_detail="low",
+                config_metadata=None,
+            )
+        self.assertEqual(result["headline"], "h")
+        self.assertEqual(mocked_post.call_count, 2)
+
+    def test_call_model_retries_malformed_json_output(self) -> None:
+        malformed = {
+            "output": [
+                {
+                    "type": "message",
+                    "content": '{"headline":"h","importance_score":1,"reason":"r"',
+                }
+            ]
+        }
+        valid = {
+            "output": [
+                {
+                    "type": "message",
+                    "content": (
+                        '{"headline":"h","importance_score":1,"reason":"r",'
+                        '"key_insights":[],"tags":[],"power_mentions":[],'
+                        '"agency_involvement":[],"lead_types":[]}'
+                    ),
+                }
+            ]
+        }
+        with mock.patch.object(gpt_ranker, "post_request", side_effect=[malformed, valid]) as mocked_post:
+            result = gpt_ranker.call_model(
+                endpoint="http://localhost:5555/api/v1",
+                api_format="chat",
+                model="qwen/qwen3-coder-next",
+                filename="DataSet10/EFTA00000001.txt",
+                text="Some useful text with enough detail for scoring.",
+                input_kind="text",
+                image_path=None,
+                image_max_pages=1,
+                image_render_dpi=180,
+                system_prompt="Return JSON",
+                api_key=None,
+                timeout=30,
+                max_retries=2,
+                retry_backoff=0,
+                temperature=0.0,
+                max_output_tokens=900,
+                reasoning_effort=None,
+                image_detail="low",
                 config_metadata=None,
             )
         self.assertEqual(result["headline"], "h")
@@ -393,7 +445,9 @@ class GptRankerHelpersTest(unittest.TestCase):
                 max_retries=1,
                 retry_backoff=0,
                 temperature=0.0,
+                max_output_tokens=900,
                 reasoning_effort=None,
+                image_detail="low",
                 config_metadata=None,
             )
 

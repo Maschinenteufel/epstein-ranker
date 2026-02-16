@@ -22,10 +22,12 @@ const DATASETS = {
     subtitle:
       "AI-ranked analysis of the DOJ File Transparency Act corpus. This dataset is processed independently from the House Oversight corpus.",
     estimateLabel: "of ~954,704+ documents.",
-    manifestUrl: "/data/workspaces/standardworks_epstein_files/metadata/chunks.json",
+    manifestUrl: "/contrib/fta/chunks.json",
     dataUrl: "/data/workspaces/standardworks_epstein_files/results/epstein_ranked.jsonl",
-    fallbackChunkPrefix: "/data/workspaces/standardworks_epstein_files/chunks",
+    fallbackChunkPrefix: "/contrib/fta",
     fallbackChunkSize: 1000,
+    volumeManifestPrefix: "/contrib/fta",
+    volumeCount: 12,
   },
 };
 const POWER_ALIAS_MAP = {
@@ -1045,7 +1047,7 @@ async function loadData() {
   resetDatasetState();
   resetLoadingState(`Loading ${dataset.label}…`, "Fetching chunk manifest");
   try {
-    const manifest = await fetchManifest(dataset.manifestUrl);
+    const manifest = await fetchDatasetManifest(dataset);
     if (manifest && manifest.chunks && manifest.chunks.length > 0) {
       await loadChunks(manifest, loadId);
       finishInitialLoadingUI();
@@ -1069,6 +1071,23 @@ async function loadData() {
     console.warn("Sequential chunk scan failed, falling back to single file.", seqErr);
   }
 
+  if (dataset.volumeManifestPrefix && dataset.volumeCount) {
+    try {
+      await loadSequentialVolumeChunks(
+        dataset.volumeManifestPrefix,
+        dataset.volumeCount,
+        dataset.fallbackChunkSize || DEFAULT_CHUNK_SIZE,
+        500,
+        loadId
+      );
+      finishInitialLoadingUI();
+      setFiltersEnabled(true, { triggerApply: true });
+      return;
+    } catch (volErr) {
+      console.warn("Per-volume chunk scan failed, falling back to single file.", volErr);
+    }
+  }
+
   try {
     await loadSingleFile(loadId, dataset.dataUrl);
     finishInitialLoadingUI();
@@ -1077,10 +1096,79 @@ async function loadData() {
     console.error("Failed to load data", error);
     finishInitialLoadingUI();
     hideInlineLoader();
+    const extraHint =
+      dataset.key === "doj_fta"
+        ? ` Ensure files like ${dataset.fallbackChunkPrefix}/VOL00001/epstein_ranked_00001_01000.jsonl exist, or provide ${dataset.manifestUrl}.`
+        : "";
     alert(
-      `Unable to load ranked outputs for ${dataset.label}. Ensure chunk files under ${dataset.fallbackChunkPrefix}/epstein_ranked_*.jsonl or ${dataset.dataUrl} exist.`
+      `Unable to load ranked outputs for ${dataset.label}. Ensure chunk files under ${dataset.fallbackChunkPrefix}/epstein_ranked_*.jsonl or ${dataset.dataUrl} exist.${extraHint}`
     );
   }
+}
+
+async function fetchDatasetManifest(dataset) {
+  const primary = await fetchManifest(dataset.manifestUrl);
+  if (primary && primary.chunks && primary.chunks.length > 0) {
+    return primary;
+  }
+  if (dataset.volumeManifestPrefix && dataset.volumeCount) {
+    const merged = await fetchVolumeManifests(dataset.volumeManifestPrefix, dataset.volumeCount);
+    if (merged && merged.chunks && merged.chunks.length > 0) {
+      return merged;
+    }
+  }
+  return primary;
+}
+
+async function fetchVolumeManifests(prefix, volumeCount) {
+  const manifests = [];
+  for (let i = 1; i <= volumeCount; i += 1) {
+    const vol = String(i).padStart(5, "0");
+    const manifestUrl = `${prefix}/VOL${vol}/chunks.json`;
+    const manifest = await fetchManifest(manifestUrl);
+    if (!manifest || !Array.isArray(manifest.chunks) || manifest.chunks.length === 0) {
+      continue;
+    }
+    manifests.push(manifest);
+  }
+
+  if (manifests.length === 0) {
+    return null;
+  }
+
+  const deduped = new Map();
+  let rowsProcessed = 0;
+  let lastUpdated = null;
+
+  for (const manifest of manifests) {
+    for (const chunk of manifest.chunks) {
+      if (!chunk || !chunk.json) continue;
+      const key = `${chunk.start_row}:${chunk.end_row}:${chunk.json}`;
+      if (!deduped.has(key)) {
+        deduped.set(key, chunk);
+      }
+    }
+    const m = manifest.metadata || {};
+    if (typeof m.rows_processed === "number") {
+      rowsProcessed += m.rows_processed;
+    }
+    if (m.last_updated && (!lastUpdated || String(m.last_updated) > String(lastUpdated))) {
+      lastUpdated = m.last_updated;
+    }
+  }
+
+  const chunks = Array.from(deduped.values()).sort(
+    (a, b) => (a.start_row || 0) - (b.start_row || 0)
+  );
+
+  return {
+    metadata: {
+      total_dataset_rows: "unknown",
+      rows_processed: rowsProcessed,
+      last_updated: lastUpdated,
+    },
+    chunks,
+  };
 }
 
 async function fetchManifest(manifestUrl) {
@@ -1239,6 +1327,84 @@ async function loadSequentialChunks(
     throw new Error("No sequential chunks readable");
   }
   updateLoadingProgress(state.loading.loadedChunks, state.loading.loadedChunks, "Loaded local chunks");
+  await hydrateRows(rows, { append: false });
+}
+
+async function loadSequentialVolumeChunks(
+  prefix,
+  volumeCount,
+  chunkSize = DEFAULT_CHUNK_SIZE,
+  maxChunksPerVolume = 500,
+  loadId = state.currentLoadId
+) {
+  const rows = [];
+  let totalAttempts = 0;
+  state.manifestMetadata = null;
+  state.loading.totalChunks = volumeCount * maxChunksPerVolume;
+  state.loading.loadedChunks = 0;
+
+  for (let i = 1; i <= volumeCount; i += 1) {
+    if (loadId !== state.currentLoadId) {
+      return;
+    }
+    const vol = String(i).padStart(5, "0");
+    let start = 1;
+    let attempts = 0;
+    let misses = 0;
+
+    while (attempts < maxChunksPerVolume && misses < 5) {
+      if (loadId !== state.currentLoadId) {
+        return;
+      }
+      const end = start + chunkSize - 1;
+      const path = `${prefix}/VOL${vol}/epstein_ranked_${String(start).padStart(5, "0")}_${String(
+        end
+      ).padStart(5, "0")}.jsonl`;
+      attempts += 1;
+      totalAttempts += 1;
+      try {
+        const response = await fetch(`${path}?t=${Date.now()}`);
+        if (!response.ok) {
+          misses += 1;
+          start += chunkSize;
+          state.loading.loadedChunks += 1;
+          updateLoadingProgress(
+            state.loading.loadedChunks,
+            state.loading.totalChunks,
+            `Scanning volume VOL${vol}…`
+          );
+          continue;
+        }
+        const text = await response.text();
+        rows.push(...parseJsonl(text));
+        misses = 0;
+        start += chunkSize;
+        state.loading.loadedChunks += 1;
+        updateLoadingProgress(
+          state.loading.loadedChunks,
+          state.loading.totalChunks,
+          `Scanning volume VOL${vol}…`
+        );
+      } catch (error) {
+        misses += 1;
+        start += chunkSize;
+        state.loading.loadedChunks += 1;
+        updateLoadingProgress(
+          state.loading.loadedChunks,
+          state.loading.totalChunks,
+          `Scanning volume VOL${vol}…`
+        );
+      }
+    }
+  }
+
+  if (rows.length === 0) {
+    throw new Error("No per-volume chunks readable");
+  }
+
+  if (totalAttempts > 0) {
+    updateLoadingProgress(state.loading.loadedChunks, state.loading.loadedChunks, "Loaded local chunks");
+  }
   await hydrateRows(rows, { append: false });
 }
 

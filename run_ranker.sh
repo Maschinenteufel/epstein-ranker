@@ -1,0 +1,393 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+PYTHON_BIN="${PYTHON_BIN:-python}"
+
+DATA_ROOT="$SCRIPT_DIR/data/new_data"
+VOLUMES_SPEC="all"
+INPUT_GLOB="*.pdf"
+PROCESSING_MODE="image"
+WORKSPACE_ROOT="data/workspaces"
+DATASET_TAG_PREFIX="standardworks_epstein_files"
+DATASET_SOURCE_LABEL="StandardWorks Epstein Files (DOJ FTA)"
+DATASET_SOURCE_URL="https://standardworks.ai/epstein-files"
+DATASET_METADATA_FILE="$SCRIPT_DIR/data/dataset_profiles/standardworks_epstein_files.json"
+GIT_OUTPUT_ROOT="contrib/fta"
+TRACK_CHUNKS_IN_GIT=1
+
+ENDPOINT="http://localhost:5555/v1"
+API_FORMAT="openai"
+MODEL="qwen/qwen3-vl-30b"
+MAX_PARALLEL_REQUESTS=4
+IMAGE_MAX_PAGES=1
+IMAGE_RENDER_DPI=120
+IMAGE_DETAIL="low"
+MAX_OUTPUT_TOKENS=900
+TEMPERATURE=0.0
+CHUNK_SIZE=1000
+MAX_ROWS=""
+
+RESUME=1
+SKIP_MISSING=1
+DRY_RUN=0
+
+EXTRA_ARGS=()
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  ./run_ranker.sh [options] [-- <extra gpt_ranker.py flags>]
+
+Core options:
+  --volumes SPEC             Volumes to run: 1,2,5-7 or all (default: all)
+  --data-root PATH           Dataset root containing VOL00001.. folders
+  --workspace-root PATH      Workspace root for isolated outputs/checkpoints
+  --dataset-tag-prefix NAME  Prefix for dataset tag (suffix _vol00001 is added)
+  --git-output-root PATH     Root for Git-tracked chunk outputs (default: contrib/fta)
+  --workspace-chunks         Keep chunks inside workspace instead of contrib/ (not tracked)
+  --glob PATTERN             File glob inside each volume (default: *.pdf)
+  --processing-mode MODE     auto | text | image (default: image)
+
+Model/runtime options:
+  --endpoint URL             Model endpoint base URL (default: http://localhost:5555/v1)
+  --api-format FORMAT        auto | openai | chat (default: openai)
+  --model ID                 Model id (default: qwen/qwen3-vl-30b)
+  --parallel N               Max parallel requests (default: 4)
+  --image-max-pages N        Max rendered PDF pages per document (default: 1)
+  --image-render-dpi N       PDF render DPI (default: 120)
+  --image-detail MODE        auto | low | high (default: low)
+  --max-output-tokens N      Max completion tokens per request (default: 900)
+  --temperature FLOAT        Sampling temperature (default: 0.0)
+  --chunk-size N             Output chunk size (default: 1000)
+  --max-rows N               Limit rows for smoke test per volume
+
+Control options:
+  --resume                   Resume from prior progress (default)
+  --no-resume                Start fresh per selected workspace/tag
+  --skip-missing             Skip volumes not yet downloaded (default)
+  --strict-missing           Exit if a requested volume directory is missing
+  --dry-run                  Print commands without running
+  -h, --help                 Show this help
+
+Examples:
+  ./run_ranker.sh --volumes 1
+  ./run_ranker.sh --volumes 1,2,6-8 --parallel 4 --dry-run
+  ./run_ranker.sh --volumes all --strict-missing
+  ./run_ranker.sh --volumes 1 -- --reasoning-effort low --sleep 0.5
+USAGE
+}
+
+rebuild_git_manifest() {
+  "$PYTHON_BIN" - "$GIT_OUTPUT_ROOT" <<'PY'
+from __future__ import annotations
+
+import glob
+import json
+import os
+import re
+import sys
+import time
+from pathlib import Path
+
+root = Path(sys.argv[1])
+pattern = str(root / "VOL*" / "epstein_ranked_*.jsonl")
+chunks = []
+rows_processed = 0
+
+for path in sorted(glob.glob(pattern)):
+    name = os.path.basename(path)
+    match = re.match(r"epstein_ranked_(\d+)_(\d+)\.jsonl$", name)
+    if not match:
+        continue
+    start = int(match.group(1))
+    end = int(match.group(2))
+    rel = Path(path).as_posix()
+    if rel.startswith("./"):
+        rel = rel[2:]
+    chunks.append({"start_row": start, "end_row": end, "json": rel})
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            rows_processed += sum(1 for _ in handle)
+    except OSError:
+        pass
+
+manifest = {
+    "metadata": {
+        "total_dataset_rows": "unknown",
+        "rows_processed": rows_processed,
+        "last_updated": time.strftime("%Y-%m-%d %H:%M:%S"),
+    },
+    "chunks": chunks,
+}
+
+root.mkdir(parents=True, exist_ok=True)
+manifest_path = root / "chunks.json"
+with manifest_path.open("w", encoding="utf-8") as handle:
+    json.dump(manifest, handle, indent=2)
+PY
+}
+
+list_existing_volumes() {
+  find "$DATA_ROOT" -maxdepth 1 -mindepth 1 -type d -name 'VOL*' -print 2>/dev/null \
+    | sed -E 's#.*/VOL0*([0-9]+)$#\1#' \
+    | grep -E '^[0-9]+$' \
+    | sort -n -u
+}
+
+expand_volumes_spec() {
+  local spec="$1"
+
+  if [[ "$spec" == "all" ]]; then
+    list_existing_volumes
+    return
+  fi
+
+  local token start end n
+  IFS=',' read -r -a tokens <<< "$spec"
+  for token in "${tokens[@]}"; do
+    token="${token//[[:space:]]/}"
+    [[ -z "$token" ]] && continue
+
+    if [[ "$token" =~ ^([0-9]{1,5})-([0-9]{1,5})$ ]]; then
+      start="${BASH_REMATCH[1]}"
+      end="${BASH_REMATCH[2]}"
+      if (( start > end )); then
+        echo "Invalid volume range '$token' (start > end)." >&2
+        return 1
+      fi
+      for ((n = start; n <= end; n++)); do
+        echo "$n"
+      done
+    elif [[ "$token" =~ ^[0-9]{1,5}$ ]]; then
+      echo "$token"
+    else
+      echo "Invalid volume token '$token'. Use numbers, ranges, or 'all'." >&2
+      return 1
+    fi
+  done | sort -n -u
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --volumes)
+      VOLUMES_SPEC="$2"
+      shift 2
+      ;;
+    --data-root)
+      DATA_ROOT="$2"
+      shift 2
+      ;;
+    --workspace-root)
+      WORKSPACE_ROOT="$2"
+      shift 2
+      ;;
+    --dataset-tag-prefix)
+      DATASET_TAG_PREFIX="$2"
+      shift 2
+      ;;
+    --git-output-root)
+      GIT_OUTPUT_ROOT="$2"
+      shift 2
+      ;;
+    --workspace-chunks)
+      TRACK_CHUNKS_IN_GIT=0
+      shift
+      ;;
+    --dataset-source-label)
+      DATASET_SOURCE_LABEL="$2"
+      shift 2
+      ;;
+    --dataset-source-url)
+      DATASET_SOURCE_URL="$2"
+      shift 2
+      ;;
+    --dataset-metadata-file)
+      DATASET_METADATA_FILE="$2"
+      shift 2
+      ;;
+    --glob)
+      INPUT_GLOB="$2"
+      shift 2
+      ;;
+    --processing-mode)
+      PROCESSING_MODE="$2"
+      shift 2
+      ;;
+    --endpoint)
+      ENDPOINT="$2"
+      shift 2
+      ;;
+    --api-format)
+      API_FORMAT="$2"
+      shift 2
+      ;;
+    --model)
+      MODEL="$2"
+      shift 2
+      ;;
+    --parallel)
+      MAX_PARALLEL_REQUESTS="$2"
+      shift 2
+      ;;
+    --image-max-pages)
+      IMAGE_MAX_PAGES="$2"
+      shift 2
+      ;;
+    --image-render-dpi)
+      IMAGE_RENDER_DPI="$2"
+      shift 2
+      ;;
+    --image-detail)
+      IMAGE_DETAIL="$2"
+      shift 2
+      ;;
+    --max-output-tokens)
+      MAX_OUTPUT_TOKENS="$2"
+      shift 2
+      ;;
+    --temperature)
+      TEMPERATURE="$2"
+      shift 2
+      ;;
+    --chunk-size)
+      CHUNK_SIZE="$2"
+      shift 2
+      ;;
+    --max-rows)
+      MAX_ROWS="$2"
+      shift 2
+      ;;
+    --resume)
+      RESUME=1
+      shift
+      ;;
+    --no-resume)
+      RESUME=0
+      shift
+      ;;
+    --skip-missing)
+      SKIP_MISSING=1
+      shift
+      ;;
+    --strict-missing)
+      SKIP_MISSING=0
+      shift
+      ;;
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      EXTRA_ARGS+=("$@")
+      break
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+done
+
+if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+  echo "Python command not found: $PYTHON_BIN" >&2
+  exit 1
+fi
+
+if [[ ! -d "$DATA_ROOT" ]]; then
+  echo "Data root not found: $DATA_ROOT" >&2
+  exit 1
+fi
+
+VOLUMES=()
+while IFS= read -r vol; do
+  [[ -n "$vol" ]] && VOLUMES+=("$vol")
+done < <(expand_volumes_spec "$VOLUMES_SPEC")
+if [[ ${#VOLUMES[@]} -eq 0 ]]; then
+  echo "No volumes selected. Check --volumes and available data under $DATA_ROOT." >&2
+  exit 1
+fi
+
+echo "Selected volumes: ${VOLUMES[*]}"
+echo "Data root: $DATA_ROOT"
+echo "Workspace root: $WORKSPACE_ROOT"
+echo "Model: $MODEL"
+echo "Endpoint: $ENDPOINT"
+
+for vol in "${VOLUMES[@]}"; do
+  VOL_DIR="$(printf "%s/VOL%05d" "$DATA_ROOT" "$vol")"
+  VOL_NAME="$(printf "VOL%05d" "$vol")"
+  DATASET_TAG="$(printf "%s_vol%05d" "$DATASET_TAG_PREFIX" "$vol")"
+  GIT_CHUNK_DIR="$GIT_OUTPUT_ROOT/$VOL_NAME"
+  GIT_CHUNK_MANIFEST="$GIT_CHUNK_DIR/chunks.json"
+
+  if [[ ! -d "$VOL_DIR" ]]; then
+    if (( SKIP_MISSING )); then
+      echo "[skip] VOL$(printf "%05d" "$vol") missing at $VOL_DIR"
+      continue
+    fi
+    echo "Missing requested volume directory: $VOL_DIR" >&2
+    exit 1
+  fi
+
+  CMD=(
+    "$PYTHON_BIN" gpt_ranker.py
+    --input "$VOL_DIR"
+    --input-glob "$INPUT_GLOB"
+    --processing-mode "$PROCESSING_MODE"
+    --dataset-workspace-root "$WORKSPACE_ROOT"
+    --dataset-tag "$DATASET_TAG"
+    --dataset-source-label "$DATASET_SOURCE_LABEL"
+    --dataset-source-url "$DATASET_SOURCE_URL"
+    --endpoint "$ENDPOINT"
+    --api-format "$API_FORMAT"
+    --model "$MODEL"
+    --max-parallel-requests "$MAX_PARALLEL_REQUESTS"
+    --image-max-pages "$IMAGE_MAX_PAGES"
+    --image-render-dpi "$IMAGE_RENDER_DPI"
+    --image-detail "$IMAGE_DETAIL"
+    --max-output-tokens "$MAX_OUTPUT_TOKENS"
+    --temperature "$TEMPERATURE"
+    --chunk-size "$CHUNK_SIZE"
+  )
+
+  if (( TRACK_CHUNKS_IN_GIT )); then
+    CMD+=(--chunk-dir "$GIT_CHUNK_DIR" --chunk-manifest "$GIT_CHUNK_MANIFEST")
+  fi
+
+  if [[ -f "$DATASET_METADATA_FILE" ]]; then
+    CMD+=(--dataset-metadata-file "$DATASET_METADATA_FILE")
+  fi
+  if (( RESUME )); then
+    CMD+=(--resume)
+  fi
+  if [[ -n "$MAX_ROWS" ]]; then
+    CMD+=(--max-rows "$MAX_ROWS")
+  fi
+  if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
+    CMD+=("${EXTRA_ARGS[@]}")
+  fi
+
+  if (( DRY_RUN )); then
+    printf '[dry-run] '
+    printf '%q ' "${CMD[@]}"
+    printf '\n'
+    continue
+  fi
+
+  echo "[run] VOL$(printf "%05d" "$vol") -> dataset-tag=$DATASET_TAG"
+  "${CMD[@]}"
+done
+
+if (( TRACK_CHUNKS_IN_GIT )) && (( ! DRY_RUN )); then
+  rebuild_git_manifest
+  echo "[done] Updated Git-tracked manifest: $GIT_OUTPUT_ROOT/chunks.json"
+fi

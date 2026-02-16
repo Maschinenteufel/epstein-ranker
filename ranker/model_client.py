@@ -291,7 +291,9 @@ def call_model(
     max_retries: int,
     retry_backoff: float,
     temperature: float,
+    max_output_tokens: int,
     reasoning_effort: Optional[str],
+    image_detail: str,
     config_metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     if input_kind not in {"text", "image"}:
@@ -329,8 +331,11 @@ def call_model(
                     if input_kind == "image":
                         content_blocks: List[Dict[str, Any]] = [{"type": "text", "text": doc_input}]
                         for image_url in image_urls:
+                            image_payload: Dict[str, Any] = {"url": image_url}
+                            if image_detail != "auto":
+                                image_payload["detail"] = image_detail
                             content_blocks.append(
-                                {"type": "image_url", "image_url": {"url": image_url}}
+                                {"type": "image_url", "image_url": image_payload}
                             )
                         user_content = content_blocks
                     else:
@@ -338,6 +343,7 @@ def call_model(
                     payload: Dict[str, Any] = {
                         "model": model,
                         "temperature": temperature,
+                        "max_tokens": max_output_tokens,
                         "messages": [
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": user_content},
@@ -367,7 +373,13 @@ def call_model(
                         timeout=timeout,
                     )
                     content = extract_chat_content(data)
-                return ensure_json_dict(content)
+                try:
+                    return ensure_json_dict(content)
+                except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                    raise ModelRequestError(
+                        f"Invalid JSON model output from {base_url}: {exc}",
+                        retriable=True,
+                    ) from exc
             except UnsupportedEndpointError as exc:
                 last_error = exc
                 continue

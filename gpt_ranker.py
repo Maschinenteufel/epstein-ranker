@@ -416,6 +416,7 @@ def calculate_workload(
 ) -> Dict[str, int]:
     total = 0
     already_done = 0
+    workload = 0
     for idx, row in enumerate(
         iter_rows(
             path,
@@ -432,9 +433,10 @@ def calculate_workload(
         total += 1
         if completed_filenames and row.get("filename") in completed_filenames:
             already_done += 1
-        if max_rows is not None and total >= max_rows:
+        else:
+            workload += 1
+        if max_rows is not None and workload >= max_rows:
             break
-    workload = max(0, total - already_done)
     return {"total": total, "already_done": already_done, "workload": workload}
 
 
@@ -646,11 +648,13 @@ def build_config_metadata(args: argparse.Namespace, prompt_source: str) -> Dict[
         "justice_files_base_url": args.justice_files_base_url,
         "source_files_base_url": args.source_files_base_url,
         "temperature": args.temperature,
+        "max_output_tokens": args.max_output_tokens,
         "max_parallel_requests": args.max_parallel_requests,
         "max_retries": args.max_retries,
         "retry_backoff": args.retry_backoff,
         "image_max_pages": args.image_max_pages,
         "image_render_dpi": args.image_render_dpi,
+        "image_detail": args.image_detail,
         "prompt_source": prompt_source,
     }
     if args.dataset_tag:
@@ -1044,6 +1048,8 @@ def main() -> None:
         sys.exit("--image-max-pages must be >= 1")
     if args.image_render_dpi < 72:
         sys.exit("--image-render-dpi must be >= 72")
+    if args.max_output_tokens < 1:
+        sys.exit("--max-output-tokens must be >= 1")
     if active_processing_mode == "image" and args.api_format == "chat":
         sys.exit(
             "Image mode is not supported with --api-format chat. "
@@ -1334,11 +1340,12 @@ def main() -> None:
                 flush_ready()
                 continue
 
-            # Show both source row index and processing progress
+            # Show source row index and submission progress.
+            # In parallel mode, completed-row counters lag while requests are in flight.
             if target_total:
-                progress_prefix = f"[Row {idx}] [{processed + 1}/{target_total} new]"
+                progress_prefix = f"[Row {idx}] [{scheduled}/{target_total} new]"
             else:
-                progress_prefix = f"[Row {idx}] [{processed + 1}]"
+                progress_prefix = f"[Row {idx}] [{scheduled}]"
 
             eta_text = format_eta(
                 start_time,
@@ -1365,7 +1372,9 @@ def main() -> None:
                 "max_retries": args.max_retries,
                 "retry_backoff": args.retry_backoff,
                 "temperature": args.temperature,
+                "max_output_tokens": args.max_output_tokens,
                 "reasoning_effort": args.reasoning_effort,
+                "image_detail": args.image_detail,
                 "config_metadata": config_metadata,
             }
 
@@ -1407,7 +1416,9 @@ def main() -> None:
                     max_retries=args.max_retries,
                     retry_backoff=args.retry_backoff,
                     temperature=args.temperature,
+                    max_output_tokens=args.max_output_tokens,
                     reasoning_effort=args.reasoning_effort,
+                    image_detail=args.image_detail,
                     config_metadata=config_metadata,
                 )
                 in_flight[future] = {"idx": idx, "row": row, "quality": quality}

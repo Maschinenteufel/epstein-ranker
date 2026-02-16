@@ -2,10 +2,10 @@
 
 **Live Site: [https://epsteingate.org](https://epsteingate.org)**
 
-LLM-powered tooling for triaging the **U.S. House Oversight Epstein Estate** document release.
+LLM-powered tooling for triaging Epstein-related document corpora.
 This project:
 
-1. Streams the document corpus through locally hosted open-source models (default vision run: `qwen/qwen3-vl-30b` via **LM Studio**) to produce ranked, structured leads.
+1. Streams document corpora through locally hosted open-source models (default vision run: `qwen/qwen3-vl-30b` via **LM Studio**) to produce ranked, structured leads.
 2. Ships a dashboard (`viewer/`) so investigators can filter, chart, and inspect every scored document (including the full source text) offline.
 
 The entire workflow operates on a single MacBook Pro (M3 Max, 128 GB RAM). With an average draw of ~100 W, a 60-hour pass consumes ≈6 kWh (~$1.50 at SoCal off-peak rates) with zero cloud/API spend.
@@ -14,12 +14,13 @@ The entire workflow operates on a single MacBook Pro (M3 Max, 128 GB RAM). Wit
 
 ## Current Progress
 
-**✓ All documents analyzed and scored**
+Status as of **February 16, 2026**:
 
-The corpus contains ~25,800 documents from the House Oversight Committee release. As of now, the first 10,000 entries (rows 1–10,000) have been processed and are available in `contrib/epstein_ranked_*.jsonl` chunk files.
-
-- **Completed:** Rows 1–10,000 (10 chunk files)
-- **Contributors welcome:** See [Collaborative ranking workflow](#collaborative-ranking-workflow) below to help process the remaining documents
+- **Primary active pipeline:** DOJ File Transparency Act corpus (`data/new_data/VOL00001...`) in image/PDF mode.
+- **Local volumes currently available:** `VOL00001` to `VOL00007`, plus `VOL00012`.
+- **Still downloading:** `VOL00008` to `VOL00011`.
+- **Isolation policy:** FTA runs are written to `data/workspaces/standardworks_epstein_files_volXXXXX/` so they do not mix with oversight outputs.
+- **Legacy oversight data:** existing House Oversight chunks remain in `contrib/` + `data/chunks.json`.
 
 ---
 
@@ -37,22 +38,19 @@ The corpus contains ~25,800 documents from the House Oversight Committee release
 
 ## Data source & provenance
 
-The repository’s base dataset is the **“20,000 Epstein Files”** text corpus prepared by [**tensonaut**](https://www.reddit.com/r/LocalLLaMA/comments/1ozu5v4/20000_epstein_files_in_a_single_text_file/), who OCR’d ~25,000 pages released by the U.S. House Committee on Oversight and Government Reform.  
-Key references:
+Primary corpus (active):
 
-- Hugging Face dataset: <https://huggingface.co/datasets/tensonaut/EPSTEIN_FILES_20K>  
-- Original release: [Oversight Committee Releases Additional Epstein Estate Documents (Nov 12, 2025)](https://oversight.house.gov/release/oversight-committee-releases-additional-epstein-estate-documents/)
+- StandardWorks File Transparency Act index: <https://standardworks.ai/epstein-files>
+- Local data root: `data/new_data/VOL00001...`
+- Dataset profile metadata: `data/dataset_profiles/standardworks_epstein_files.json`
+- DOJ source links are generated using `--justice-files-base-url` and stored per record (`source_pdf_url`).
 
-**Corpus outline (summarized from the dataset card):**
+Legacy corpus (still supported):
 
-- >25,000 plain-text documents derived from the committee’s Google Drive distribution.
-- `TEXT/` files were converted directly from native text sources; `IMAGES/` files (≈20k JPGs) were OCR’d with Tesseract.
-- Filenames preserve the source path so you can cross-reference with the official release.
-- No manual edits beyond text extraction/OCR; expect OCR noise, redaction markers, or broken formatting.
-- Legal status: documents originate from the House release and retain any original copyright. This repo asserts no ownership and offers no legal advice—ensure your use complies with applicable law.
-- Content warning: expect references to sexual abuse, exploitation, trafficking, violence, and unverified allegations.
+- Hugging Face OCR dataset by **tensonaut**: <https://huggingface.co/datasets/tensonaut/EPSTEIN_FILES_20K>
+- House Oversight release reference (Nov 12, 2025): [Oversight Committee Releases Additional Epstein Estate Documents](https://oversight.house.gov/release/oversight-committee-releases-additional-epstein-estate-documents/)
 
-Huge thanks to **tensonaut** for the foundational OCR and dataset packaging; this project simply layers ranking and analytics on top.
+Both corpora include sensitive material (abuse, trafficking, violence, unverified allegations). Use accordingly and validate claims before publication.
 
 ---
 
@@ -61,7 +59,8 @@ Huge thanks to **tensonaut** for the foundational OCR and dataset packaging; thi
 - Python 3.9+
 - `requests`
 - LM Studio (or another local gateway) serving your selected model locally (for vision runs: `qwen/qwen3-vl-30b` via OpenAI-compatible `http://localhost:5555/v1`)
-- The dataset CSV (`data/EPS_FILES_20K_NOV2026.csv`). **Not included in this repo**—download it from the Hugging Face link above and place it in `data/` (see `data/README.md` for instructions).
+- For the active FTA workflow: downloaded volume folders under `data/new_data/` (for example `VOL00001`, `VOL00002`, ...).
+- Optional legacy text workflow: `data/EPS_FILES_20K_NOV2026.csv` from the Hugging Face link above.
 
 Install Python deps (only `requests` is needed):
 
@@ -73,24 +72,40 @@ python -m pip install -r requirements.txt  # or just: python -m pip install requ
 
 ## Running the ranker
 
+Recommended (FTA image/PDF workflow): use the helper script.
+
 ```bash
-cp ranker_config.example.toml ranker_config.toml  # optional defaults
+./run_ranker.sh --volumes 1
+./run_ranker.sh --volumes 1,2,6-7 --parallel 4
+./run_ranker.sh --volumes 1-12 --dry-run
+./run_ranker.sh --volumes all -- --reasoning-effort low --sleep 0.5
+```
+
+`run_ranker.sh` automatically:
+
+- Resolves selected volumes (`1`, `1,2,6-7`, or `all`).
+- Uses workspace isolation per volume (`standardworks_epstein_files_volXXXXX`).
+- Writes Git-trackable chunk outputs to `contrib/fta/VOLXXXXX/` by default.
+- Rebuilds a global FTA manifest at `contrib/fta/chunks.json` after each run (used by the DOJ dataset view).
+- Uses `--resume` by default.
+- Skips missing volumes by default (use `--strict-missing` to fail instead).
+
+Direct CLI example (single volume, no wrapper):
+
+```bash
 python gpt_ranker.py \
   --input data/new_data/VOL00001 \
   --input-glob "*.pdf" \
   --processing-mode image \
-  --output data/epstein_ranked.csv \
-  --json-output data/epstein_ranked.jsonl \
+  --dataset-workspace-root data/workspaces \
+  --dataset-tag standardworks_epstein_files_vol00001 \
   --endpoint http://localhost:5555/v1 \
   --api-format openai \
   --model qwen/qwen3-vl-30b \
   --max-parallel-requests 4 \
   --image-max-pages 1 \
   --image-render-dpi 180 \
-  --resume \
-  --sleep 0.5 \
-  --config ranker_config.toml \
-  --reasoning-effort low
+  --resume
 ```
 
 ## Code layout
@@ -100,7 +115,8 @@ python gpt_ranker.py \
 - `ranker/model_client.py`: endpoint fallback, retries, text/vision request building.
 - `ranker/constants.py`: canonical maps and shared constants.
 
-By default, the ranker writes **1,000-row chunks** to `contrib/` and updates `data/chunks.json`.  
+By default, direct CLI runs write **1,000-row chunks** to `contrib/` and update `data/chunks.json`.  
+When using `run_ranker.sh`, checkpoints/metadata stay in `data/workspaces/<dataset-tag>/` while chunk outputs are written to `contrib/fta/VOLXXXXX/` for Git tracking.
 Set `--chunk-size 0` if you really want a single CSV/JSONL output (not recommended for sharing).
 
 Notable flags:
@@ -116,8 +132,9 @@ Notable flags:
 - `--checkpoint data/.epstein_checkpoint`: stores processed filenames to guard against duplication.
 - `--reasoning-effort low/high`: trade accuracy for speed if your model exposes the reasoning control knob.
 - `--max-parallel-requests`: number of concurrent requests to LM Studio (default `4`).
+- `--max-output-tokens`: hard cap for completion length per request (useful to stop runaway outputs).
 - `--api-format`: `auto` (default), `openai`, or `chat`. Vision/image mode requires `openai` (or `auto`, which resolves to OpenAI format).
-- `--image-max-pages`, `--image-render-dpi`: configure PDF page rendering for multimodal inference.
+- `--image-max-pages`, `--image-render-dpi`, `--image-detail`: configure PDF rendering + vision detail level for multimodal inference.
 - `--max-retries`, `--retry-backoff`: retry transient endpoint failures with exponential backoff.
 - `--skip-low-quality` / `--no-skip-low-quality`: enable/disable pre-LLM filtering for empty/short/noisy OCR rows.
 - `--min-text-chars`, `--min-text-words`, `--min-alpha-ratio`, `--min-unique-word-ratio`, `--max-short-token-ratio`, `--min-avg-word-length`, `--min-long-word-count`, `--max-repeated-char-run`: tune skip thresholds (helps skip OCR gibberish with mostly short tokens).
@@ -132,6 +149,7 @@ Notable flags:
 - `--chunk-size`, `--chunk-dir`, `--chunk-manifest`: control chunk splitting, where chunk files live, and where the manifest is written.
 - `--overwrite-output`: explicitly allow truncating existing files (default is to refuse unless `--resume` or unique paths are used).
 - `--power-watts`, `--electric-rate`, `--run-hours`: plug in your local power draw/cost to estimate total electricity usage (also configurable via the TOML file).
+- `run_ranker.sh --workspace-chunks`: keep chunks inside ignored workspace paths instead of `contrib/fta/` if you do not want Git-tracked outputs.
 
 Pause/resume behavior:
 
@@ -141,8 +159,9 @@ Pause/resume behavior:
 
 Outputs:
 
-- `contrib/epstein_ranked_<start>_<end>.jsonl` – Default chunked outputs (one file per 1,000 rows) that contain the headline, score, metadata, and original text for each document. Skipped files are retained with `processing_status=skipped` and `skip_reason`.
-- `data/chunks.json` – Manifest listing all chunk files (the viewer uses this to load data).
+- `contrib/fta/VOLXXXXX/epstein_ranked_<start>_<end>.jsonl` + `contrib/fta/VOLXXXXX/chunks.json` – Default per-volume, Git-trackable outputs when using `run_ranker.sh`.
+- `contrib/fta/chunks.json` – Global manifest auto-built by `run_ranker.sh` so the DOJ viewer can load all tracked volume chunks.
+- `contrib/epstein_ranked_<start>_<end>.jsonl` + `data/chunks.json` – Default chunk outputs/manifest for direct CLI runs without workspace mode.
 - `data/epstein_ranked.csv/jsonl` – Only produced if you disable chunking via `--chunk-size 0`.
 - `data/workspaces/<dataset-tag>/metadata/run_metadata.json` – Optional run provenance sidecar (enabled automatically in workspace mode).
 
@@ -152,10 +171,11 @@ For large non-oversight corpora (like `data/new_data`), run in isolated workspac
 
 ```bash
 python gpt_ranker.py \
-  --input data/new_data \
-  --input-glob "*.txt" \
+  --input data/new_data/VOL00001 \
+  --input-glob "*.pdf" \
+  --processing-mode image \
   --dataset-workspace-root data/workspaces \
-  --dataset-tag standardworks_epstein_files \
+  --dataset-tag standardworks_epstein_files_vol00001 \
   --dataset-source-label "StandardWorks Epstein Files" \
   --dataset-source-url "https://standardworks.ai/epstein-files" \
   --dataset-metadata-file data/dataset_profiles/standardworks_epstein_files.json \
@@ -259,7 +279,7 @@ Open <http://localhost:9000>. Features:
 - Charts showing lead-type distribution, score histogram, top power mentions, and top agencies.
 - Methodology accordion describing the scoring criteria, prompt, and compute footprint.
 
-`viewer/app.js` reads `data/chunks.json` by default, so remember to commit updated manifests + chunk files. If no manifest exists, it automatically scans for files named `contrib/epstein_ranked_*.jsonl` before falling back to `data/epstein_ranked.jsonl`.
+`viewer/app.js` reads `data/chunks.json` by default. If no manifest exists, it automatically scans for files named `contrib/epstein_ranked_*.jsonl` before falling back to `data/epstein_ranked.jsonl`.
 
 ---
 
