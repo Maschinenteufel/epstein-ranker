@@ -244,6 +244,16 @@ def parse_args() -> argparse.Namespace:
         help="Optional API key for servers that require authentication.",
     )
     parser.add_argument(
+        "--http-referer",
+        default=None,
+        help="Optional HTTP-Referer header (recommended by OpenRouter).",
+    )
+    parser.add_argument(
+        "--x-title",
+        default=None,
+        help="Optional X-Title header (recommended by OpenRouter).",
+    )
+    parser.add_argument(
         "--reasoning-effort",
         choices=["low", "medium", "high"],
         help="If provided, passes reasoning effort hints supported by some models.",

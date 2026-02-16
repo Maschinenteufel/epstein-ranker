@@ -649,6 +649,8 @@ def build_config_metadata(args: argparse.Namespace, prompt_source: str) -> Dict[
         "source_files_base_url": args.source_files_base_url,
         "temperature": args.temperature,
         "max_output_tokens": args.max_output_tokens,
+        "http_referer": args.http_referer,
+        "x_title": args.x_title,
         "max_parallel_requests": args.max_parallel_requests,
         "max_retries": args.max_retries,
         "retry_backoff": args.retry_backoff,
@@ -1055,6 +1057,11 @@ def main() -> None:
             "Image mode is not supported with --api-format chat. "
             "Use --api-format openai or --api-format auto."
         )
+    if "openrouter.ai" in args.endpoint and not args.api_key:
+        sys.exit(
+            "OpenRouter endpoint detected but --api-key is missing. "
+            "Provide --api-key or set it via your config."
+        )
     if args.start_row < 1:
         sys.exit("--start-row must be >= 1")
     if args.end_row is not None and args.end_row < args.start_row:
@@ -1375,6 +1382,8 @@ def main() -> None:
                 "max_output_tokens": args.max_output_tokens,
                 "reasoning_effort": args.reasoning_effort,
                 "image_detail": args.image_detail,
+                "http_referer": args.http_referer,
+                "x_title": args.x_title,
                 "config_metadata": config_metadata,
             }
 
@@ -1419,6 +1428,8 @@ def main() -> None:
                     max_output_tokens=args.max_output_tokens,
                     reasoning_effort=args.reasoning_effort,
                     image_detail=args.image_detail,
+                    http_referer=args.http_referer,
+                    x_title=args.x_title,
                     config_metadata=config_metadata,
                 )
                 in_flight[future] = {"idx": idx, "row": row, "quality": quality}

@@ -59,6 +59,7 @@ Both corpora include sensitive material (abuse, trafficking, violence, unverifie
 - Python 3.9+
 - `requests`
 - LM Studio (or another local gateway) serving your selected model locally (for vision runs: `qwen/qwen3-vl-30b` via OpenAI-compatible `http://localhost:5555/v1`)
+- Optional hosted provider: OpenRouter (`https://openrouter.ai/api/v1`) with API key
 - For the active FTA workflow: downloaded volume folders under `data/new_data/` (for example `VOL00001`, `VOL00002`, ...).
 - Optional legacy text workflow: `data/EPS_FILES_20K_NOV2026.csv` from the Hugging Face link above.
 
@@ -76,10 +77,24 @@ Recommended (FTA image/PDF workflow): use the helper script.
 
 ```bash
 ./run_ranker.sh --volumes 1
+./run_ranker.sh --provider openrouter --openrouter-api-key sk-or-... --volumes 1 --parallel 2
 ./run_ranker.sh --volumes 1,2,6-7 --parallel 4
 ./run_ranker.sh --volumes 1-12 --dry-run
 ./run_ranker.sh --volumes all -- --reasoning-effort low --sleep 0.5
 ```
+
+OpenRouter key file (recommended):
+
+1. Create `/Users/linovaldovinos/Documents/LatentPlayground/EpstineFileRanker/EpsteinFileRanker-deploy/source/.env.openrouter`
+2. Add:
+
+```bash
+OPENROUTER_API_KEY='sk-or-...'
+OPENROUTER_REFERER='https://epsteingate.org'
+OPENROUTER_TITLE='Epstein File Ranker'
+```
+
+`run_ranker.sh` auto-loads `.env.openrouter` (or `OPENROUTER_ENV_FILE=/custom/path`), and this file is git-ignored by default.
 
 `run_ranker.sh` automatically:
 
@@ -133,6 +148,7 @@ Notable flags:
 - `--reasoning-effort low/high`: trade accuracy for speed if your model exposes the reasoning control knob.
 - `--max-parallel-requests`: number of concurrent requests to LM Studio (default `4`).
 - `--max-output-tokens`: hard cap for completion length per request (useful to stop runaway outputs).
+- `--api-key`, `--http-referer`, `--x-title`: auth and optional headers for hosted OpenAI-compatible endpoints (including OpenRouter).
 - `--api-format`: `auto` (default), `openai`, or `chat`. Vision/image mode requires `openai` (or `auto`, which resolves to OpenAI format).
 - `--image-max-pages`, `--image-render-dpi`, `--image-detail`: configure PDF rendering + vision detail level for multimodal inference.
 - `--max-retries`, `--retry-backoff`: retry transient endpoint failures with exponential backoff.

@@ -5,6 +5,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
+OPENROUTER_ENV_FILE="${OPENROUTER_ENV_FILE:-$SCRIPT_DIR/.env.openrouter}"
+
+if [[ -f "$OPENROUTER_ENV_FILE" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$OPENROUTER_ENV_FILE"
+  set +a
+fi
 
 DATA_ROOT="$SCRIPT_DIR/data/new_data"
 VOLUMES_SPEC="all"
@@ -21,6 +29,16 @@ TRACK_CHUNKS_IN_GIT=1
 ENDPOINT="http://localhost:5555/v1"
 API_FORMAT="openai"
 MODEL="qwen/qwen3-vl-30b"
+PROVIDER="local"
+OPENROUTER_MODEL="qwen/qwen3-vl-30b-a3b-instruct"
+OPENROUTER_API_KEY="${OPENROUTER_API_KEY:-}"
+OPENROUTER_REFERER="${OPENROUTER_REFERER:-}"
+OPENROUTER_TITLE="${OPENROUTER_TITLE:-Epstein File Ranker}"
+API_KEY=""
+HTTP_REFERER=""
+X_TITLE=""
+MODEL_EXPLICIT=0
+ENDPOINT_EXPLICIT=0
 MAX_PARALLEL_REQUESTS=4
 IMAGE_MAX_PAGES=1
 IMAGE_RENDER_DPI=120
@@ -52,9 +70,18 @@ Core options:
   --processing-mode MODE     auto | text | image (default: image)
 
 Model/runtime options:
+  --provider NAME            local | openrouter (default: local)
   --endpoint URL             Model endpoint base URL (default: http://localhost:5555/v1)
   --api-format FORMAT        auto | openai | chat (default: openai)
   --model ID                 Model id (default: qwen/qwen3-vl-30b)
+  --api-key KEY              API key for hosted providers
+  --http-referer URL         HTTP-Referer header (OpenRouter recommendation)
+  --x-title NAME             X-Title header (OpenRouter recommendation)
+  --openrouter-model ID      OpenRouter model id (default: qwen/qwen3-vl-30b-a3b-instruct)
+  --openrouter-env-file PATH OpenRouter env file (default: .env.openrouter)
+  --openrouter-api-key KEY   OpenRouter key (or set OPENROUTER_API_KEY)
+  --openrouter-referer URL   OpenRouter referer override (or OPENROUTER_REFERER)
+  --openrouter-title NAME    OpenRouter title override (or OPENROUTER_TITLE)
   --parallel N               Max parallel requests (default: 4)
   --image-max-pages N        Max rendered PDF pages per document (default: 1)
   --image-render-dpi N       PDF render DPI (default: 120)
@@ -74,6 +101,7 @@ Control options:
 
 Examples:
   ./run_ranker.sh --volumes 1
+  ./run_ranker.sh --provider openrouter --openrouter-api-key sk-... --volumes 1 --parallel 2
   ./run_ranker.sh --volumes 1,2,6-8 --parallel 4 --dry-run
   ./run_ranker.sh --volumes all --strict-missing
   ./run_ranker.sh --volumes 1 -- --reasoning-effort low --sleep 0.5
@@ -218,14 +246,61 @@ while [[ $# -gt 0 ]]; do
       ;;
     --endpoint)
       ENDPOINT="$2"
+      ENDPOINT_EXPLICIT=1
       shift 2
       ;;
     --api-format)
       API_FORMAT="$2"
       shift 2
       ;;
+    --provider)
+      PROVIDER="$2"
+      shift 2
+      ;;
     --model)
       MODEL="$2"
+      MODEL_EXPLICIT=1
+      shift 2
+      ;;
+    --api-key)
+      API_KEY="$2"
+      shift 2
+      ;;
+    --http-referer)
+      HTTP_REFERER="$2"
+      shift 2
+      ;;
+    --x-title)
+      X_TITLE="$2"
+      shift 2
+      ;;
+    --openrouter-model)
+      OPENROUTER_MODEL="$2"
+      shift 2
+      ;;
+    --openrouter-env-file)
+      OPENROUTER_ENV_FILE="$2"
+      if [[ -f "$OPENROUTER_ENV_FILE" ]]; then
+        set -a
+        # shellcheck disable=SC1090
+        source "$OPENROUTER_ENV_FILE"
+        set +a
+      fi
+      OPENROUTER_API_KEY="${OPENROUTER_API_KEY:-}"
+      OPENROUTER_REFERER="${OPENROUTER_REFERER:-}"
+      OPENROUTER_TITLE="${OPENROUTER_TITLE:-Epstein File Ranker}"
+      shift 2
+      ;;
+    --openrouter-api-key)
+      OPENROUTER_API_KEY="$2"
+      shift 2
+      ;;
+    --openrouter-referer)
+      OPENROUTER_REFERER="$2"
+      shift 2
+      ;;
+    --openrouter-title)
+      OPENROUTER_TITLE="$2"
       shift 2
       ;;
     --parallel)
@@ -307,6 +382,30 @@ if [[ ! -d "$DATA_ROOT" ]]; then
   exit 1
 fi
 
+if [[ "$PROVIDER" == "openrouter" ]]; then
+  API_FORMAT="openai"
+  if (( ENDPOINT_EXPLICIT == 0 )); then
+    ENDPOINT="https://openrouter.ai/api/v1"
+  fi
+  if (( MODEL_EXPLICIT == 0 )); then
+    MODEL="$OPENROUTER_MODEL"
+  fi
+  if [[ -z "$API_KEY" ]]; then
+    API_KEY="$OPENROUTER_API_KEY"
+  fi
+  if [[ -z "$HTTP_REFERER" ]]; then
+    HTTP_REFERER="$OPENROUTER_REFERER"
+  fi
+  if [[ -z "$X_TITLE" ]]; then
+    X_TITLE="$OPENROUTER_TITLE"
+  fi
+  if [[ -z "$API_KEY" ]] && (( ! DRY_RUN )); then
+    echo "OpenRouter provider selected but no API key found." >&2
+    echo "Use --openrouter-api-key, --api-key, or set OPENROUTER_API_KEY." >&2
+    exit 1
+  fi
+fi
+
 VOLUMES=()
 while IFS= read -r vol; do
   [[ -n "$vol" ]] && VOLUMES+=("$vol")
@@ -319,6 +418,7 @@ fi
 echo "Selected volumes: ${VOLUMES[*]}"
 echo "Data root: $DATA_ROOT"
 echo "Workspace root: $WORKSPACE_ROOT"
+echo "Provider: $PROVIDER"
 echo "Model: $MODEL"
 echo "Endpoint: $ENDPOINT"
 
@@ -366,6 +466,15 @@ for vol in "${VOLUMES[@]}"; do
   if [[ -f "$DATASET_METADATA_FILE" ]]; then
     CMD+=(--dataset-metadata-file "$DATASET_METADATA_FILE")
   fi
+  if [[ -n "$API_KEY" ]]; then
+    CMD+=(--api-key "$API_KEY")
+  fi
+  if [[ -n "$HTTP_REFERER" ]]; then
+    CMD+=(--http-referer "$HTTP_REFERER")
+  fi
+  if [[ -n "$X_TITLE" ]]; then
+    CMD+=(--x-title "$X_TITLE")
+  fi
   if (( RESUME )); then
     CMD+=(--resume)
   fi
@@ -377,8 +486,21 @@ for vol in "${VOLUMES[@]}"; do
   fi
 
   if (( DRY_RUN )); then
+    REDACTED_CMD=()
+    SENSITIVE_NEXT=0
+    for arg in "${CMD[@]}"; do
+      if (( SENSITIVE_NEXT )); then
+        REDACTED_CMD+=("***REDACTED***")
+        SENSITIVE_NEXT=0
+        continue
+      fi
+      REDACTED_CMD+=("$arg")
+      if [[ "$arg" == "--api-key" ]]; then
+        SENSITIVE_NEXT=1
+      fi
+    done
     printf '[dry-run] '
-    printf '%q ' "${CMD[@]}"
+    printf '%q ' "${REDACTED_CMD[@]}"
     printf '\n'
     continue
   fi

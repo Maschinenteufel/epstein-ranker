@@ -307,7 +307,7 @@ class GptRankerHelpersTest(unittest.TestCase):
             ]
         }
 
-        def side_effect(*, url, payload, api_key, timeout):
+        def side_effect(*, url, payload, api_key, extra_headers, timeout):
             if url.endswith("/chat/completions"):
                 raise gpt_ranker.UnsupportedEndpointError("no completions route")
             return response_payload

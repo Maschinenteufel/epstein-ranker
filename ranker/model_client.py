@@ -172,11 +172,14 @@ def post_request(
     url: str,
     payload: Dict[str, Any],
     api_key: Optional[str],
+    extra_headers: Optional[Dict[str, str]],
     timeout: float,
 ) -> Dict[str, Any]:
     headers = {}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
+    if extra_headers:
+        headers.update(extra_headers)
 
     try:
         response = requests.post(url, json=payload, timeout=timeout, headers=headers)
@@ -294,6 +297,8 @@ def call_model(
     max_output_tokens: int,
     reasoning_effort: Optional[str],
     image_detail: str,
+    http_referer: Optional[str] = None,
+    x_title: Optional[str] = None,
     config_metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     if input_kind not in {"text", "image"}:
@@ -311,6 +316,11 @@ def call_model(
         effective_api_format,
         prefer_openai=(input_kind == "image"),
     )
+    extra_headers: Dict[str, str] = {}
+    if http_referer:
+        extra_headers["HTTP-Referer"] = http_referer
+    if x_title:
+        extra_headers["X-Title"] = x_title
     doc_input = build_text_analysis_input(filename, text)
     image_urls: List[str] = []
     if input_kind == "image" and image_path is not None:
@@ -357,6 +367,7 @@ def call_model(
                         url=f"{base_url}/chat/completions",
                         payload=payload,
                         api_key=api_key,
+                        extra_headers=extra_headers or None,
                         timeout=timeout,
                     )
                     content = extract_openai_content(data)
@@ -370,6 +381,7 @@ def call_model(
                         url=f"{base_url}/chat",
                         payload=payload,
                         api_key=api_key,
+                        extra_headers=extra_headers or None,
                         timeout=timeout,
                     )
                     content = extract_chat_content(data)
