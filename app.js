@@ -41,6 +41,9 @@ const POWER_ALIAS_MAP = {
   "jeffrey epstein": ["jeffrey epstein", "jeff epstein", "epstein"],
   "elon musk": ["elon musk", "elon r musk", "musk"],
 };
+const ARCHIVE_CDX_LIMIT = 50;
+const archiveSnapshotCache = new Map();
+const archiveSnapshotPromiseCache = new Map();
 
 const elements = {
   datasetSelector: document.getElementById("datasetSelector"),
@@ -74,6 +77,7 @@ const elements = {
   detailSourceUrl: document.getElementById("detailSourceUrl"),
   detailSourceJustice: document.getElementById("detailSourceJustice"),
   detailSourceLocal: document.getElementById("detailSourceLocal"),
+  detailSourceArchive: document.getElementById("detailSourceArchive"),
   detailTextPanel: document.getElementById("detailTextPanel"),
   detailText: document.getElementById("detailText"),
   detailTextPreview: document.getElementById("detailTextPreview"),
@@ -678,6 +682,207 @@ function deriveLocalSourceUrl(row) {
   return null;
 }
 
+function deriveArchiveSourceUrl(sourceUrl) {
+  if (!sourceUrl || typeof sourceUrl !== "string") return null;
+  const trimmed = sourceUrl.trim();
+  if (!trimmed) return null;
+  try {
+    const normalized = new URL(trimmed).href;
+    return `https://web.archive.org/web/*/${normalized}`;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function buildArchiveSnapshotUrl(timestamp, sourceUrl) {
+  if (!timestamp || !sourceUrl) return null;
+  try {
+    const normalizedSource = new URL(sourceUrl).href;
+    return `https://web.archive.org/web/${timestamp}id_/${normalizedSource}`;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function normalizeArchiveReplayUrl(url) {
+  if (!url || typeof url !== "string") return null;
+  const trimmed = url.trim();
+  if (!trimmed) return null;
+  const httpsUrl = trimmed.replace(/^http:\/\//i, "https://");
+  const replayMatch = httpsUrl.match(/\/web\/(\d{14})(?:[^/]*)\/(https?:\/\/.+)$/i);
+  if (!replayMatch) {
+    return httpsUrl;
+  }
+  return buildArchiveSnapshotUrl(replayMatch[1], replayMatch[2]) || httpsUrl;
+}
+
+function pickCdxSnapshot(rows, sourceUrl) {
+  if (!Array.isArray(rows) || rows.length <= 1) return null;
+  const candidates = rows
+    .slice(1)
+    .filter((entry) => Array.isArray(entry) && entry.length >= 4)
+    .map((entry) => ({
+      timestamp: String(entry[0] || "").trim(),
+      status: String(entry[2] || "").trim(),
+      mimetype: String(entry[3] || "").toLowerCase(),
+    }))
+    .filter((entry) => entry.timestamp && entry.status === "200");
+  if (candidates.length === 0) return null;
+
+  // Prefer oldest true PDF-like capture first to avoid newer replay/challenge pages.
+  const preferred = candidates.find(
+    (entry) =>
+      entry.mimetype.includes("pdf") ||
+      entry.mimetype.includes("octet-stream") ||
+      entry.mimetype.includes("binary")
+  );
+  const chosen = preferred || candidates[0];
+  return buildArchiveSnapshotUrl(chosen.timestamp, sourceUrl);
+}
+
+async function resolveBestArchiveSnapshotUrl(sourceUrl) {
+  if (!sourceUrl || typeof sourceUrl !== "string") return null;
+
+  let normalized;
+  try {
+    normalized = new URL(sourceUrl).href;
+  } catch (_error) {
+    return null;
+  }
+
+  if (archiveSnapshotCache.has(normalized)) {
+    return archiveSnapshotCache.get(normalized);
+  }
+  if (archiveSnapshotPromiseCache.has(normalized)) {
+    return archiveSnapshotPromiseCache.get(normalized);
+  }
+
+  const pending = (async () => {
+    let resolved = null;
+
+    try {
+      const cdxUrl =
+        `https://web.archive.org/cdx/search/cdx?url=${encodeURIComponent(normalized)}` +
+        `&output=json&fl=timestamp,original,statuscode,mimetype&filter=statuscode:200&limit=${ARCHIVE_CDX_LIMIT}`;
+      const cdxResponse = await fetch(cdxUrl);
+      if (cdxResponse.ok) {
+        const cdxRows = await cdxResponse.json();
+        resolved = pickCdxSnapshot(cdxRows, normalized);
+      }
+    } catch (_error) {
+      resolved = null;
+    }
+
+    if (!resolved) {
+      try {
+        const availabilityUrl = `https://archive.org/wayback/available?url=${encodeURIComponent(normalized)}`;
+        const availabilityResponse = await fetch(availabilityUrl);
+        if (availabilityResponse.ok) {
+          const data = await availabilityResponse.json();
+          const closest = data?.archived_snapshots?.closest || null;
+          if (closest?.timestamp) {
+            resolved = buildArchiveSnapshotUrl(String(closest.timestamp), normalized);
+          } else if (closest?.url) {
+            resolved = normalizeArchiveReplayUrl(String(closest.url));
+          }
+        }
+      } catch (_error) {
+        resolved = null;
+      }
+    }
+
+    archiveSnapshotCache.set(normalized, resolved);
+    archiveSnapshotPromiseCache.delete(normalized);
+    return resolved;
+  })();
+
+  archiveSnapshotPromiseCache.set(normalized, pending);
+  return pending;
+}
+
+function normalizeComparableLink(value) {
+  if (!value || typeof value !== "string") return "";
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  try {
+    return new URL(trimmed).href;
+  } catch (_error) {
+    return trimmed.replace(/\\/g, "/");
+  }
+}
+
+function linksMatch(a, b) {
+  const normalizedA = normalizeComparableLink(a);
+  const normalizedB = normalizeComparableLink(b);
+  return normalizedA !== "" && normalizedA === normalizedB;
+}
+
+function pickBestAvailableSourceUrl(row) {
+  const sourcePdfUrl = row?.source_pdf_url || null;
+  const justiceUrl = row?.justice_source_url || null;
+  const localUrl = row?.local_source_url || null;
+  const archiveUrl = row?.archive_source_url || null;
+
+  if (sourcePdfUrl && !linksMatch(sourcePdfUrl, justiceUrl)) {
+    return sourcePdfUrl;
+  }
+  if (localUrl) return localUrl;
+  if (justiceUrl) return justiceUrl;
+  return archiveUrl;
+}
+
+function setDetailAnchor(element, text, href) {
+  if (!element) return;
+  if (href) {
+    element.textContent = text;
+    element.href = href;
+    element.classList.remove("disabled");
+    return;
+  }
+  element.textContent = "Not available";
+  element.removeAttribute("href");
+  element.classList.add("disabled");
+}
+
+function setArchiveLinkLoadingState(row) {
+  if (!elements.detailSourceArchive) return;
+  const fallbackArchiveUrl = row?.archive_source_url || null;
+  if (fallbackArchiveUrl) {
+    setDetailAnchor(elements.detailSourceArchive, "Finding best archive snapshot...", fallbackArchiveUrl);
+    return;
+  }
+  elements.detailSourceArchive.textContent = "Finding best archive snapshot...";
+  elements.detailSourceArchive.removeAttribute("href");
+  elements.detailSourceArchive.classList.add("disabled");
+}
+
+async function hydrateArchiveLinkForRow(row) {
+  const rowKey = row?.source_id || row?.filename || null;
+  if (!rowKey) return;
+
+  const justiceUrl = row?.justice_source_url || null;
+  if (!justiceUrl) {
+    setDetailAnchor(
+      elements.detailSourceArchive,
+      "Open Internet Archive snapshot",
+      row?.archive_source_url || null
+    );
+    return;
+  }
+
+  setArchiveLinkLoadingState(row);
+  const resolved = await resolveBestArchiveSnapshotUrl(justiceUrl);
+
+  // Row changed while we were resolving the snapshot.
+  if (state.activeRowId !== rowKey) return;
+
+  setDetailAnchor(
+    elements.detailSourceArchive,
+    "Open Internet Archive snapshot",
+    resolved || row?.archive_source_url || null
+  );
+}
+
 function deriveVolumeLabel(row) {
   const formatVolume = (num) => `VOL${String(num).padStart(5, "0")}`;
   const readVolume = (value) => {
@@ -753,6 +958,11 @@ function normalizeRow(row) {
     (typeof row.metadata?.local_source_url === "string" && row.metadata.local_source_url) ||
     deriveLocalSourceUrl(row) ||
     null;
+  const archiveSourceUrl =
+    (typeof row.archive_source_url === "string" && row.archive_source_url) ||
+    (typeof row.metadata?.archive_source_url === "string" && row.metadata.archive_source_url) ||
+    deriveArchiveSourceUrl(justiceSourceUrl || derivedJusticePdfUrl) ||
+    null;
   const normalized = {
     source_id: sourceId,
     filename: row.filename,
@@ -779,6 +989,7 @@ function normalizeRow(row) {
     metadata: row.metadata || {},
     justice_source_url: justiceSourceUrl,
     local_source_url: localSourceUrl,
+    archive_source_url: archiveSourceUrl,
     source_pdf_url:
       (typeof row.source_pdf_url === "string" && row.source_pdf_url) ||
       (typeof row.metadata?.source_pdf_url === "string" && row.metadata.source_pdf_url) ||
@@ -2086,23 +2297,16 @@ function renderDetail(row, options = {}) {
   // Display model if available in metadata
   const model = row.metadata?.config?.model || "—";
   elements.detailModel.textContent = model;
-  const setDetailLink = (element, text, href) => {
-    if (!element) return;
-    if (href) {
-      element.textContent = text;
-      element.href = href;
-      element.classList.remove("disabled");
-      return;
-    }
-    element.textContent = "Not available";
-    element.removeAttribute("href");
-    element.classList.add("disabled");
-  };
-
-  const resolvedSourceUrl = row.source_pdf_url || row.justice_source_url || row.local_source_url || null;
-  setDetailLink(elements.detailSourceUrl, "Open source file", resolvedSourceUrl);
-  setDetailLink(elements.detailSourceJustice, "Open DOJ source", row.justice_source_url || null);
-  setDetailLink(elements.detailSourceLocal, "Open local reference", row.local_source_url || null);
+  const resolvedSourceUrl = pickBestAvailableSourceUrl(row);
+  setDetailAnchor(elements.detailSourceUrl, "Open source file", resolvedSourceUrl);
+  setDetailAnchor(elements.detailSourceJustice, "Open DOJ source", row.justice_source_url || null);
+  setDetailAnchor(elements.detailSourceLocal, "Open local reference", row.local_source_url || null);
+  setDetailAnchor(
+    elements.detailSourceArchive,
+    "Open Internet Archive snapshot",
+    row.archive_source_url || null
+  );
+  void hydrateArchiveLinkForRow(row);
 
   // Hide the text panel entirely when no source text is available (image-first runs).
   const originalText = (row.original_text || "").trim();
@@ -2160,6 +2364,11 @@ function clearDetail() {
     elements.detailSourceLocal.textContent = "—";
     elements.detailSourceLocal.removeAttribute("href");
     elements.detailSourceLocal.classList.remove("disabled");
+  }
+  if (elements.detailSourceArchive) {
+    elements.detailSourceArchive.textContent = "—";
+    elements.detailSourceArchive.removeAttribute("href");
+    elements.detailSourceArchive.classList.remove("disabled");
   }
   if (elements.detailTextPanel) {
     elements.detailTextPanel.classList.remove("hidden");

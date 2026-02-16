@@ -17,10 +17,22 @@ The entire workflow operates on a single MacBook Pro (M3 Max, 128 GB RAM). Wit
 Status as of **February 16, 2026**:
 
 - **Primary active pipeline:** DOJ File Transparency Act corpus (`data/new_data/VOL00001...`) in image/PDF mode.
-- **Local volumes currently available:** `VOL00001` to `VOL00007`, plus `VOL00012`.
-- **Still downloading:** `VOL00008` to `VOL00011`.
+- **Local volumes currently available:** `VOL00001` to `VOL00008`, `VOL00010`, `VOL00011`, and `VOL00012`.
+- **Still pending locally:** `VOL00009`.
 - **Isolation policy:** FTA runs are written to `data/workspaces/standardworks_epstein_files_volXXXXX/` so they do not mix with oversight outputs.
 - **Legacy oversight data:** existing House Oversight chunks remain in `contrib/` + `data/chunks.json`.
+
+### Volume verification snapshot (raw package integrity)
+
+Using the bundled load-file indexes (`DATA/VOLxxxxx.DAT` and `DATA/VOLxxxxx.OPT`) as the source of truth:
+
+- `VOL00003`: `67` documents, `1,847` pages, `67` PDF files present (matches local package metadata).
+- `VOL00004`: `152` documents, `2,704` pages, `152` PDF files present (matches local package metadata).
+- `VOL00005`: `120` documents, `120` pages, `120` PDF files present (matches local package metadata).
+
+Notes:
+- The StandardWorks profile currently lists +1 document/page for volumes 3-5 versus the local package indexes.
+- Processing status snapshot (chunk outputs): `VOL00003` complete (`67/67`), `VOL00004` has one row pending (`151/152`, missing `IMAGES/0001/EFTA00005932.pdf`), `VOL00005` is in progress.
 
 ---
 
