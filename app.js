@@ -688,6 +688,10 @@ function deriveArchiveSourceUrl(sourceUrl) {
   if (!trimmed) return null;
   try {
     const normalized = new URL(trimmed).href;
+    const host = new URL(normalized).hostname.toLowerCase();
+    if (host === "web.archive.org" || host === "archive.org") {
+      return normalizeArchiveReplayUrl(normalized);
+    }
     return `https://web.archive.org/web/*/${normalized}`;
   } catch (_error) {
     return null;
@@ -696,9 +700,11 @@ function deriveArchiveSourceUrl(sourceUrl) {
 
 function buildArchiveSnapshotUrl(timestamp, sourceUrl) {
   if (!timestamp || !sourceUrl) return null;
+  const normalizedTimestamp = String(timestamp).trim();
+  if (!/^\d{14}$/.test(normalizedTimestamp)) return null;
   try {
     const normalizedSource = new URL(sourceUrl).href;
-    return `https://web.archive.org/web/${timestamp}id_/${normalizedSource}`;
+    return `https://web.archive.org/web/${normalizedTimestamp}id_/${normalizedSource}`;
   } catch (_error) {
     return null;
   }
@@ -729,6 +735,7 @@ function pickCdxSnapshot(rows, sourceUrl) {
     .filter((entry) => entry.timestamp && entry.status === "200");
   if (candidates.length === 0) return null;
 
+  candidates.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
   // Prefer oldest true PDF-like capture first to avoid newer replay/challenge pages.
   const preferred = candidates.find(
     (entry) =>
@@ -831,6 +838,27 @@ function pickBestAvailableSourceUrl(row) {
   return archiveUrl;
 }
 
+function isArchiveHostUrl(value) {
+  if (!value || typeof value !== "string") return false;
+  try {
+    const host = new URL(value).hostname.toLowerCase();
+    return host === "web.archive.org" || host === "archive.org";
+  } catch (_error) {
+    return false;
+  }
+}
+
+function resolveArchiveLookupSourceUrl(row) {
+  const candidates = [row?.justice_source_url, row?.source_pdf_url];
+  for (const candidate of candidates) {
+    if (typeof candidate !== "string" || candidate.trim().length === 0) continue;
+    if (!isArchiveHostUrl(candidate)) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
 function setDetailAnchor(element, text, href) {
   if (!element) return;
   if (href) {
@@ -844,13 +872,8 @@ function setDetailAnchor(element, text, href) {
   element.classList.add("disabled");
 }
 
-function setArchiveLinkLoadingState(row) {
+function setArchiveLinkLoadingState() {
   if (!elements.detailSourceArchive) return;
-  const fallbackArchiveUrl = row?.archive_source_url || null;
-  if (fallbackArchiveUrl) {
-    setDetailAnchor(elements.detailSourceArchive, "Finding best archive snapshot...", fallbackArchiveUrl);
-    return;
-  }
   elements.detailSourceArchive.textContent = "Finding best archive snapshot...";
   elements.detailSourceArchive.removeAttribute("href");
   elements.detailSourceArchive.classList.add("disabled");
@@ -860,8 +883,8 @@ async function hydrateArchiveLinkForRow(row) {
   const rowKey = row?.source_id || row?.filename || null;
   if (!rowKey) return;
 
-  const justiceUrl = row?.justice_source_url || null;
-  if (!justiceUrl) {
+  const archiveLookupSourceUrl = resolveArchiveLookupSourceUrl(row);
+  if (!archiveLookupSourceUrl) {
     setDetailAnchor(
       elements.detailSourceArchive,
       "Open Internet Archive snapshot",
@@ -870,8 +893,8 @@ async function hydrateArchiveLinkForRow(row) {
     return;
   }
 
-  setArchiveLinkLoadingState(row);
-  const resolved = await resolveBestArchiveSnapshotUrl(justiceUrl);
+  setArchiveLinkLoadingState();
+  const resolved = await resolveBestArchiveSnapshotUrl(archiveLookupSourceUrl);
 
   // Row changed while we were resolving the snapshot.
   if (state.activeRowId !== rowKey) return;
@@ -958,10 +981,13 @@ function normalizeRow(row) {
     (typeof row.metadata?.local_source_url === "string" && row.metadata.local_source_url) ||
     deriveLocalSourceUrl(row) ||
     null;
-  const archiveSourceUrl =
+  const archiveSourceCandidate =
     (typeof row.archive_source_url === "string" && row.archive_source_url) ||
     (typeof row.metadata?.archive_source_url === "string" && row.metadata.archive_source_url) ||
+    null;
+  const archiveSourceUrl =
     deriveArchiveSourceUrl(justiceSourceUrl || derivedJusticePdfUrl) ||
+    normalizeArchiveReplayUrl(archiveSourceCandidate) ||
     null;
   const normalized = {
     source_id: sourceId,
