@@ -80,6 +80,7 @@ Recommended (FTA image/PDF workflow): use the helper script.
 ./run_ranker.sh --volumes 1
 ./run_ranker.sh --provider openrouter --openrouter-api-key sk-or-... --volumes 1 --parallel 2
 ./run_ranker.sh --volumes 1,2,6-7 --parallel 4 --parallel-scheduling batch
+./run_ranker.sh --provider openrouter --volumes 3 --image-max-pages 8 --pdf-pages-per-image 4
 ./run_ranker.sh --volumes 1-12 --dry-run
 ./run_ranker.sh --volumes all -- --reasoning-effort low
 ```
@@ -154,6 +155,8 @@ Notable flags:
 - `--api-key`, `--http-referer`, `--x-title`: auth and optional headers for hosted OpenAI-compatible endpoints (including OpenRouter).
 - `--api-format`: `auto` (default), `openai`, or `chat`. Vision/image mode requires `openai` (or `auto`, which resolves to OpenAI format).
 - `--image-max-pages`, `--image-render-dpi`, `--image-detail`: configure PDF rendering + vision detail level for multimodal inference.
+- `--pdf-pages-per-image`: pack multiple PDF pages into one tiled image block before sending to the model (for example `4` = 2x2 collage).
+- `--pdf-part-pages`: split long PDFs into independent part records (`source_id`, `document_part`, `part_index`, `part_total`, page range fields) so each page window can be processed and reviewed separately.
 - `--max-retries`, `--retry-backoff`: retry transient endpoint failures with exponential backoff.
 - `--skip-low-quality` / `--no-skip-low-quality`: enable/disable pre-LLM filtering for empty/short/noisy OCR rows.
 - `--min-text-chars`, `--min-text-words`, `--min-alpha-ratio`, `--min-unique-word-ratio`, `--max-short-token-ratio`, `--min-avg-word-length`, `--min-long-word-count`, `--max-repeated-char-run`: tune skip thresholds (helps skip OCR gibberish with mostly short tokens).
@@ -294,6 +297,7 @@ Open <http://localhost:9000>. Features:
 
 - Automatically loads any chunk listed in `data/chunks.json` (falls back to `data/epstein_ranked.jsonl` if no chunks exist).
 - AG Grid table sorted by importance score (click a row to expand the detail drawer and read the entire document text).
+- DOJ dataset rows include `Volume` and `Part` fields; split PDF parts are tracked with stable `source_id`s so filtering/selection stays consistent.
 - Filters for score threshold, lead types, power mentions, ad hoc search, and row limits.
 - Charts showing lead-type distribution, score histogram, top power mentions, and top agencies.
 - Methodology accordion describing the scoring criteria, prompt, and compute footprint.

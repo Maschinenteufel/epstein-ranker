@@ -22,6 +22,8 @@ timeout = 1200.0  # HTTP request timeout in seconds (10 minutes)
 max_retries = 3
 retry_backoff = 1.5
 image_max_pages = 1
+pdf_pages_per_image = 1  # Set to 4 for 2x2 page collages per image block
+pdf_part_pages = 0  # If >0, split large PDFs into part records of this many pages
 image_render_dpi = 120
 image_detail = "low"  # auto | low | high. Lower detail reduces visual token usage.
 

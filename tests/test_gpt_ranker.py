@@ -72,6 +72,33 @@ class GptRankerHelpersTest(unittest.TestCase):
         self.assertEqual(rows[0]["input_kind"], "image")
         self.assertEqual(rows[0]["text"], "")
 
+    def test_iter_rows_splits_pdf_into_parts_when_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            image_pdf = root / "doc.pdf"
+            image_pdf.write_bytes(b"%PDF-1.4\n")
+            with mock.patch.object(gpt_ranker, "detect_pdf_page_count", return_value=10):
+                rows = list(
+                    gpt_ranker.iter_rows(
+                        root,
+                        input_glob="*.pdf",
+                        include_text=False,
+                        processing_mode="image",
+                        pdf_part_pages=4,
+                    )
+                )
+
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(rows[0]["part_index"], 1)
+        self.assertEqual(rows[0]["part_total"], 3)
+        self.assertEqual(rows[0]["part_start_page"], 1)
+        self.assertEqual(rows[0]["part_end_page"], 4)
+        self.assertIn("::part_0001_p00001-00004", rows[0]["source_id"])
+        self.assertEqual(rows[1]["part_start_page"], 5)
+        self.assertEqual(rows[1]["part_end_page"], 8)
+        self.assertEqual(rows[2]["part_start_page"], 9)
+        self.assertEqual(rows[2]["part_end_page"], 10)
+
     def test_skip_reason_flags_low_quality_rows(self) -> None:
         quality = gpt_ranker.assess_text_quality("x")
         reason = gpt_ranker.build_skip_reason(quality, self.skip_args)
@@ -119,6 +146,49 @@ class GptRankerHelpersTest(unittest.TestCase):
         self.assertEqual(json_record["metadata"]["skip_reason"], "empty text")
         self.assertEqual(csv_row["source_pdf_url"], "")
 
+    def test_build_output_records_includes_part_metadata(self) -> None:
+        source_row = {
+            "filename": "VOL00003/IMAGES/0001/EFTA00000001.pdf",
+            "source_id": "VOL00003/IMAGES/0001/EFTA00000001.pdf::part_0002_p00025-00048",
+            "document_part": "part_0002_of_0005_p00025-00048",
+            "part_index": 2,
+            "part_total": 5,
+            "part_start_page": 25,
+            "part_end_page": 48,
+            "document_total_pages": 117,
+            "text": "",
+        }
+        result = {
+            "headline": "h",
+            "importance_score": 42,
+            "reason": "r",
+            "key_insights": [],
+            "tags": [],
+            "power_mentions": [],
+            "agency_involvement": [],
+            "lead_types": [],
+        }
+        csv_row, json_record = gpt_ranker.build_output_records(
+            idx=10,
+            source_row=source_row,
+            result=result,
+            args=self.skip_args,
+            config_metadata={"model": "qwen/qwen3-vl-30b"},
+            quality={},
+            processing_status="processed",
+            skip_reason="",
+        )
+
+        self.assertEqual(
+            csv_row["source_id"],
+            "VOL00003/IMAGES/0001/EFTA00000001.pdf::part_0002_p00025-00048",
+        )
+        self.assertEqual(csv_row["document_part"], "part_0002_of_0005_p00025-00048")
+        self.assertEqual(csv_row["part_index"], 2)
+        self.assertEqual(csv_row["part_total"], 5)
+        self.assertEqual(json_record["document_total_pages"], 117)
+        self.assertEqual(json_record["metadata"]["part_start_page"], 25)
+
     def test_derive_justice_pdf_url_from_dataset_path(self) -> None:
         filename = "DataSet10/IMAGES/0332/EFTA01970985.txt"
         url = gpt_ranker.derive_justice_pdf_url(filename)
@@ -129,6 +199,26 @@ class GptRankerHelpersTest(unittest.TestCase):
 
     def test_derive_justice_pdf_url_returns_none_when_unmatched(self) -> None:
         self.assertIsNone(gpt_ranker.derive_justice_pdf_url("notes/no_match.txt"))
+
+    def test_derive_justice_pdf_url_from_volume_path(self) -> None:
+        url = gpt_ranker.derive_justice_pdf_url(
+            "IMAGES/0001/EFTA00000001.pdf",
+            source_path="/tmp/data/new_data/VOL00001/IMAGES/0001/EFTA00000001.pdf",
+        )
+        self.assertEqual(
+            url,
+            "https://www.justice.gov/epstein/files/DataSet%201/EFTA00000001.pdf",
+        )
+
+    def test_derive_justice_pdf_url_from_dataset_tag(self) -> None:
+        url = gpt_ranker.derive_justice_pdf_url(
+            "IMAGES/0001/EFTA00000001.pdf",
+            dataset_tag="standardworks_epstein_files_vol00001",
+        )
+        self.assertEqual(
+            url,
+            "https://www.justice.gov/epstein/files/DataSet%201/EFTA00000001.pdf",
+        )
 
     def test_derive_local_source_url_maps_data_path(self) -> None:
         source_url = gpt_ranker.derive_local_source_url(

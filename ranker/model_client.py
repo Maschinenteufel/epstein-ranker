@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
+import math
 import re
 import subprocess
 import tempfile
@@ -38,8 +40,29 @@ def build_text_analysis_input(filename: str, text: str) -> str:
     )
 
 
-def build_image_analysis_instruction(filename: str, page_count: int) -> str:
-    pages_label = f"{page_count} page(s)" if page_count > 0 else "the provided page image"
+def build_image_analysis_instruction(
+    filename: str,
+    page_count: int,
+    *,
+    total_pages: Optional[int] = None,
+    start_page: int = 1,
+    part_index: Optional[int] = None,
+    part_total: Optional[int] = None,
+) -> str:
+    page_end = max(start_page, start_page + max(page_count, 1) - 1)
+    part_label = ""
+    if part_index is not None and part_total is not None and part_total > 1:
+        part_label = f" (part {part_index}/{part_total})"
+    if total_pages is not None and total_pages > page_count:
+        pages_label = (
+            f"sampled pages {start_page}-{page_end} of {total_pages} page(s){part_label}"
+        )
+    else:
+        pages_label = (
+            f"pages {start_page}-{page_end}{part_label}"
+            if page_count > 0
+            else "the provided page image"
+        )
     return (
         "Analyze this source document image and respond with the JSON schema "
         "described in the system prompt.\n"
@@ -123,7 +146,12 @@ def image_path_to_data_url(image_path: Path) -> str:
     return f"data:{mime};base64,{encoded}"
 
 
-def render_pdf_page_to_data_url(pdf_path: Path, *, page_number: int, dpi: int) -> str:
+def encode_png_bytes_to_data_url(png_bytes: bytes) -> str:
+    encoded = base64.b64encode(png_bytes).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
+
+
+def render_pdf_page_to_png_bytes(pdf_path: Path, *, page_number: int, dpi: int) -> bytes:
     with tempfile.TemporaryDirectory(prefix="epstein_pdf_render_") as tmpdir:
         out_prefix = Path(tmpdir) / f"page_{page_number}"
         cmd = [
@@ -149,8 +177,73 @@ def render_pdf_page_to_data_url(pdf_path: Path, *, page_number: int, dpi: int) -
         rendered_path = out_prefix.with_suffix(".png")
         if not rendered_path.exists():
             raise RuntimeError(f"PDF rendering produced no image for {pdf_path}")
-        encoded = base64.b64encode(rendered_path.read_bytes()).decode("ascii")
-        return f"data:image/png;base64,{encoded}"
+        return rendered_path.read_bytes()
+
+
+def render_pdf_page_to_data_url(pdf_path: Path, *, page_number: int, dpi: int) -> str:
+    return encode_png_bytes_to_data_url(
+        render_pdf_page_to_png_bytes(pdf_path, page_number=page_number, dpi=dpi)
+    )
+
+
+def detect_pdf_page_count(pdf_path: Path) -> Optional[int]:
+    cmd = ["pdfinfo", str(pdf_path)]
+    try:
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    except FileNotFoundError:
+        return None
+    except subprocess.CalledProcessError:
+        return None
+    match = re.search(r"^Pages:\s+(\d+)\s*$", result.stdout, flags=re.MULTILINE)
+    if not match:
+        return None
+    try:
+        page_count = int(match.group(1))
+    except ValueError:
+        return None
+    return page_count if page_count > 0 else None
+
+
+def compose_png_pages_to_data_urls(
+    page_pngs: List[bytes],
+    *,
+    pages_per_image: int,
+) -> List[str]:
+    if pages_per_image <= 1:
+        return [encode_png_bytes_to_data_url(png) for png in page_pngs]
+    try:
+        from PIL import Image  # type: ignore
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError(
+            "pdf page packing requires Pillow. Install via: python -m pip install pillow"
+        ) from exc
+
+    packed_urls: List[str] = []
+    for start in range(0, len(page_pngs), pages_per_image):
+        chunk = page_pngs[start : start + pages_per_image]
+        if not chunk:
+            continue
+        images = []
+        for png in chunk:
+            with Image.open(io.BytesIO(png)) as image:
+                images.append(image.convert("RGB"))
+        cols = max(1, math.ceil(math.sqrt(len(images))))
+        rows = max(1, math.ceil(len(images) / cols))
+        cell_w = max(img.width for img in images)
+        cell_h = max(img.height for img in images)
+        canvas = Image.new("RGB", (cols * cell_w, rows * cell_h), "white")
+        for idx, img in enumerate(images):
+            row = idx // cols
+            col = idx % cols
+            x = col * cell_w + max((cell_w - img.width) // 2, 0)
+            y = row * cell_h + max((cell_h - img.height) // 2, 0)
+            canvas.paste(img, (x, y))
+            img.close()
+        output = io.BytesIO()
+        canvas.save(output, format="PNG", optimize=True)
+        canvas.close()
+        packed_urls.append(encode_png_bytes_to_data_url(output.getvalue()))
+    return packed_urls
 
 
 def prepare_image_data_urls(
@@ -158,14 +251,35 @@ def prepare_image_data_urls(
     *,
     max_pages: int,
     render_dpi: int,
-) -> List[str]:
+    pdf_pages_per_image: int = 1,
+    start_page: int = 1,
+) -> Tuple[List[str], int, Optional[int]]:
     suffix = image_path.suffix.lower()
     if suffix == ".pdf":
-        return [
-            render_pdf_page_to_data_url(image_path, page_number=page_number, dpi=render_dpi)
-            for page_number in range(1, max_pages + 1)
+        pdf_page_count = detect_pdf_page_count(image_path)
+        first_page = max(1, start_page)
+        if pdf_page_count is not None and first_page > pdf_page_count:
+            raise RuntimeError(
+                f"PDF page window start {first_page} exceeds page count {pdf_page_count} for {image_path}"
+            )
+        target_pages = (
+            max(1, min(max_pages, pdf_page_count - first_page + 1))
+            if pdf_page_count is not None
+            else max_pages
+        )
+        page_pngs = [
+            render_pdf_page_to_png_bytes(image_path, page_number=page_number, dpi=render_dpi)
+            for page_number in range(first_page, first_page + target_pages)
         ]
-    return [image_path_to_data_url(image_path)]
+        return (
+            compose_png_pages_to_data_urls(
+                page_pngs,
+                pages_per_image=max(1, pdf_pages_per_image),
+            ),
+            target_pages,
+            pdf_page_count,
+        )
+    return [image_path_to_data_url(image_path)], 1, None
 
 
 def post_request(
@@ -298,6 +412,10 @@ def call_model(
     max_output_tokens: int,
     reasoning_effort: Optional[str],
     image_detail: str,
+    pdf_pages_per_image: int = 1,
+    image_start_page: int = 1,
+    image_part_index: Optional[int] = None,
+    image_part_total: Optional[int] = None,
     request_semaphore: Optional[threading.Semaphore] = None,
     http_referer: Optional[str] = None,
     x_title: Optional[str] = None,
@@ -326,12 +444,21 @@ def call_model(
     doc_input = build_text_analysis_input(filename, text)
     image_urls: List[str] = []
     if input_kind == "image" and image_path is not None:
-        image_urls = prepare_image_data_urls(
+        image_urls, source_page_count, source_total_pages = prepare_image_data_urls(
             image_path,
             max_pages=max(1, image_max_pages),
             render_dpi=max(72, image_render_dpi),
+            pdf_pages_per_image=max(1, pdf_pages_per_image),
+            start_page=max(1, image_start_page),
         )
-        doc_input = build_image_analysis_instruction(filename, len(image_urls))
+        doc_input = build_image_analysis_instruction(
+            filename,
+            source_page_count,
+            total_pages=source_total_pages,
+            start_page=max(1, image_start_page),
+            part_index=image_part_index,
+            part_total=image_part_total,
+        )
 
     last_error: Optional[Exception] = None
     for attempt in range(1, max_retries + 1):

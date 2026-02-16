@@ -268,6 +268,16 @@ function getGridColumnDefs() {
       tooltipValueGetter: (params) => params.data?.volume_label || "—",
     },
     {
+      headerName: "Part",
+      field: "part_label",
+      width: 180,
+      minWidth: 145,
+      maxWidth: 230,
+      hide: isMobile || state.activeDatasetKey !== "doj_fta",
+      cellRenderer: (params) => `<span class="cell-text">${params.value || "full document"}</span>`,
+      tooltipValueGetter: (params) => params.data?.part_label || "full document",
+    },
+    {
       headerName: "Headline",
       field: "headline",
       flex: isMobile ? 1 : 6,
@@ -361,7 +371,7 @@ function initGrid() {
       }
     },
     onRowClicked: (event) => renderDetail(event.data, { scrollToDetail: true }),
-    getRowId: (params) => params.data.filename,
+    getRowId: (params) => params.data.source_id || params.data.filename,
   };
 
   new agGrid.Grid(gridElement, state.gridOptions);
@@ -576,14 +586,54 @@ function findCanonicalByToken(key) {
   return null;
 }
 
-function deriveJusticePdfUrl(filename) {
-  if (!filename) return null;
-  const datasetMatch = String(filename).match(/DataSet\\s*0*(\\d+)/i);
-  const eftaMatch = String(filename).match(/(EFTA\\d{8})/i);
-  if (!datasetMatch || !eftaMatch) return null;
-  const datasetNumber = Number.parseInt(datasetMatch[1], 10);
+function deriveJusticePdfUrl(row) {
+  const candidates = [
+    row?.filename,
+    row?.source_pdf_url,
+    row?.metadata?.source_pdf_url,
+    row?.metadata?.original_row?.filename,
+    row?.metadata?.original_row?.source_path,
+    row?.metadata?.config?.dataset_tag,
+    row?.volume_label,
+  ]
+    .filter((value) => typeof value === "string" && value.trim().length > 0)
+    .map((value) => String(value));
+  if (candidates.length === 0) return null;
+
+  let eftaId = null;
+  for (const value of candidates) {
+    const match = value.match(/(EFTA\d{8})/i);
+    if (match) {
+      eftaId = match[1].toUpperCase();
+      break;
+    }
+  }
+  if (!eftaId) return null;
+
+  let datasetNumber = null;
+  for (const value of candidates) {
+    const datasetMatch = value.match(/DataSet(?:%20|\s)*0*(\d+)/i);
+    if (datasetMatch) {
+      const parsed = Number.parseInt(datasetMatch[1], 10);
+      if (Number.isFinite(parsed) && parsed > 0) {
+        datasetNumber = parsed;
+        break;
+      }
+    }
+  }
+  if (datasetNumber === null) {
+    for (const value of candidates) {
+      const volMatch = value.match(/(?:^|[/_\\-])vol(?:ume)?[_-]?0*(\d{1,5})(?:$|[/_\\-])/i);
+      if (volMatch) {
+        const parsed = Number.parseInt(volMatch[1], 10);
+        if (Number.isFinite(parsed) && parsed > 0) {
+          datasetNumber = parsed;
+          break;
+        }
+      }
+    }
+  }
   if (!Number.isFinite(datasetNumber) || datasetNumber < 1) return null;
-  const eftaId = eftaMatch[1].toUpperCase();
   return `https://www.justice.gov/epstein/files/DataSet%20${datasetNumber}/${eftaId}.pdf`;
 }
 
@@ -619,14 +669,51 @@ function deriveVolumeLabel(row) {
 }
 
 function normalizeRow(row) {
+  const parseOptionalNumber = (value) => {
+    if (value === null || value === undefined) return null;
+    if (typeof value === "string" && value.trim() === "") return null;
+    const num = Number(value);
+    return Number.isFinite(num) ? num : null;
+  };
   const importance = Number(row.importance_score ?? 0);
   const arrays = (value) => (Array.isArray(value) ? value : []);
   const rawPowers = arrays(row.power_mentions)
     .map((p) => (typeof p === "string" ? p.trim() : String(p ?? "").trim()))
     .filter(Boolean);
   const normalizedPowers = normalizePowerMentions(rawPowers);
+  const sourceId = String(row.source_id || row.metadata?.source_id || row.filename || "").trim();
+  const partIndex = parseOptionalNumber(row.part_index) ?? parseOptionalNumber(row.metadata?.part_index);
+  const partTotal = parseOptionalNumber(row.part_total) ?? parseOptionalNumber(row.metadata?.part_total);
+  const partStartPage =
+    parseOptionalNumber(row.part_start_page) ?? parseOptionalNumber(row.metadata?.part_start_page);
+  const partEndPage =
+    parseOptionalNumber(row.part_end_page) ?? parseOptionalNumber(row.metadata?.part_end_page);
+  const hasSplitPart =
+    Number.isFinite(partIndex) &&
+    Number.isFinite(partTotal) &&
+    Number(partTotal) > 1;
+  const inferredPartLabel = hasSplitPart
+    ? (() => {
+        const partSegment = `part ${partIndex}/${partTotal}`;
+        if (Number.isFinite(partStartPage) && Number.isFinite(partEndPage) && partEndPage >= partStartPage) {
+          return `${partSegment} (pages ${partStartPage}-${partEndPage})`;
+        }
+        return partSegment;
+      })()
+    : "";
+  const derivedJusticePdfUrl = deriveJusticePdfUrl(row);
   const normalized = {
+    source_id: sourceId,
     filename: row.filename,
+    document_part: String(row.document_part || row.metadata?.document_part || "").trim(),
+    part_index: partIndex,
+    part_total: partTotal,
+    part_start_page: partStartPage,
+    part_end_page: partEndPage,
+    document_total_pages:
+      parseOptionalNumber(row.document_total_pages) ??
+      parseOptionalNumber(row.metadata?.document_total_pages),
+    part_label: String(row.document_part || row.metadata?.document_part || "").trim() || inferredPartLabel,
     volume_label: deriveVolumeLabel(row),
     source_row_index: row.metadata?.source_row_index ?? null,
     headline: row.headline || row.metadata?.original_row?.filename || "Untitled lead",
@@ -640,16 +727,19 @@ function normalizeRow(row) {
     lead_types: arrays(row.lead_types),
     metadata: row.metadata || {},
     source_pdf_url:
+      derivedJusticePdfUrl ||
       row.source_pdf_url ||
       row.metadata?.source_pdf_url ||
-      deriveJusticePdfUrl(row.filename || row.metadata?.original_row?.filename || ""),
+      null,
     original_text:
       typeof row.metadata?.original_row?.text === "string"
         ? row.metadata.original_row.text
         : "",
   };
   normalized.search_blob = [
+    normalized.source_id,
     normalized.volume_label,
+    normalized.part_label,
     normalized.headline,
     normalized.reason,
     normalized.key_insights.join(" "),
@@ -723,7 +813,10 @@ function updateVolumeFilterVisibility() {
     elements.volumeFilter.value = ALL_VOLUMES_VALUE;
   }
   if (state.gridOptions?.columnApi) {
-    state.gridOptions.columnApi.setColumnsVisible(["volume_label"], isDoj && !isMobileView());
+    state.gridOptions.columnApi.setColumnsVisible(
+      ["volume_label", "part_label"],
+      isDoj && !isMobileView()
+    );
   }
 }
 
@@ -1842,13 +1935,14 @@ function renderDetail(row, options = {}) {
     clearDetail();
     return;
   }
-  state.activeRowId = row.filename || null;
+  state.activeRowId = row.source_id || row.filename || null;
   elements.detailDrawer.classList.remove("hidden");
 
   // Get terms to highlight
   const highlightTerms = getHighlightTerms();
 
-  const headlineText = `${row.headline || row.filename} (${row.filename})`;
+  const partSuffix = row.part_label ? ` | ${row.part_label}` : "";
+  const headlineText = `${row.headline || row.filename} (${row.filename}${partSuffix})`;
   elements.detailTitle.innerHTML = highlightText(headlineText, highlightTerms);
   elements.detailReason.innerHTML = highlightText(row.reason || "—", highlightTerms);
   elements.detailLeadTypes.innerHTML = highlightText(row.lead_types.join(", ") || "—", highlightTerms);

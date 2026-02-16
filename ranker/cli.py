@@ -358,6 +358,24 @@ def parse_args() -> argparse.Namespace:
         help="Maximum PDF pages to render and send per document in image mode.",
     )
     parser.add_argument(
+        "--pdf-pages-per-image",
+        type=int,
+        default=1,
+        help=(
+            "When >1, pack this many PDF pages into one tiled image before model input "
+            "(example: 4 = 2x2 collage per image block)."
+        ),
+    )
+    parser.add_argument(
+        "--pdf-part-pages",
+        type=int,
+        default=0,
+        help=(
+            "If >0, split each PDF into independent part records of this many pages "
+            "(example: 24 yields part_001, part_002, ...)."
+        ),
+    )
+    parser.add_argument(
         "--image-render-dpi",
         type=int,
         default=180,

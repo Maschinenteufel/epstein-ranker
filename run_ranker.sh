@@ -43,6 +43,8 @@ MAX_PARALLEL_REQUESTS=4
 PARALLEL_SCHEDULING="batch"
 IMAGE_PREFETCH=0
 IMAGE_MAX_PAGES=1
+PDF_PAGES_PER_IMAGE=1
+PDF_PART_PAGES=0
 IMAGE_RENDER_DPI=120
 IMAGE_DETAIL="low"
 MAX_OUTPUT_TOKENS=900
@@ -89,6 +91,8 @@ Model/runtime options:
   --parallel-scheduling MODE auto | window | batch (default: batch)
   --image-prefetch N         Extra queued image tasks beyond --parallel (default: 0)
   --image-max-pages N        Max rendered PDF pages per document (default: 1)
+  --pdf-pages-per-image N    Pack N PDF pages into one tiled image block (default: 1)
+  --pdf-part-pages N         Split each PDF into N-page parts (default: 0 = disabled)
   --image-render-dpi N       PDF render DPI (default: 120)
   --image-detail MODE        auto | low | high (default: low)
   --max-output-tokens N      Max completion tokens per request (default: 900)
@@ -325,6 +329,14 @@ while [[ $# -gt 0 ]]; do
       IMAGE_MAX_PAGES="$2"
       shift 2
       ;;
+    --pdf-pages-per-image)
+      PDF_PAGES_PER_IMAGE="$2"
+      shift 2
+      ;;
+    --pdf-part-pages)
+      PDF_PART_PAGES="$2"
+      shift 2
+      ;;
     --image-render-dpi)
       IMAGE_RENDER_DPI="$2"
       shift 2
@@ -472,6 +484,8 @@ for vol in "${VOLUMES[@]}"; do
     --parallel-scheduling "$PARALLEL_SCHEDULING"
     --image-prefetch "$IMAGE_PREFETCH"
     --image-max-pages "$IMAGE_MAX_PAGES"
+    --pdf-pages-per-image "$PDF_PAGES_PER_IMAGE"
+    --pdf-part-pages "$PDF_PART_PAGES"
     --image-render-dpi "$IMAGE_RENDER_DPI"
     --image-detail "$IMAGE_DETAIL"
     --max-output-tokens "$MAX_OUTPUT_TOKENS"

@@ -7,6 +7,7 @@ import argparse
 import concurrent.futures
 import csv
 import json
+import math
 import re
 import sys
 import threading
@@ -40,6 +41,7 @@ from ranker.model_client import (
     build_image_analysis_instruction,
     build_request_targets,
     build_text_analysis_input,
+    detect_pdf_page_count,
     derive_localhost_fallback_endpoints,
     ensure_json_dict,
     extract_chat_content,
@@ -87,6 +89,7 @@ def iter_rows(
     input_glob: str = "*.txt",
     include_text: bool = True,
     processing_mode: str = "auto",
+    pdf_part_pages: int = 0,
 ) -> Iterable[Dict[str, Any]]:
     if path.is_dir():
         for file_path in sorted(path.rglob(input_glob)):
@@ -95,11 +98,54 @@ def iter_rows(
             input_kind = infer_row_input_kind(file_path, processing_mode)
             if not input_kind:
                 continue
+            rel_filename = file_path.relative_to(path).as_posix()
+            if (
+                input_kind == "image"
+                and file_path.suffix.lower() == ".pdf"
+                and pdf_part_pages > 0
+            ):
+                total_pages = detect_pdf_page_count(file_path)
+                if total_pages is not None and total_pages > pdf_part_pages:
+                    total_parts = max(1, math.ceil(total_pages / pdf_part_pages))
+                    for part_index in range(1, total_parts + 1):
+                        part_start_page = (part_index - 1) * pdf_part_pages + 1
+                        part_end_page = min(total_pages, part_start_page + pdf_part_pages - 1)
+                        source_id = (
+                            f"{rel_filename}::part_{part_index:04d}_p{part_start_page:05d}-{part_end_page:05d}"
+                        )
+                        yield {
+                            "filename": rel_filename,
+                            "source_id": source_id,
+                            "text": "",
+                            "input_kind": input_kind,
+                            "source_path": str(file_path),
+                            "part_index": part_index,
+                            "part_total": total_parts,
+                            "part_start_page": part_start_page,
+                            "part_end_page": part_end_page,
+                            "document_total_pages": total_pages,
+                            "document_part": (
+                                f"part_{part_index:04d}_of_{total_parts:04d}_p{part_start_page:05d}-{part_end_page:05d}"
+                            ),
+                            "analysis_filename": (
+                                f"{rel_filename} "
+                                f"(part {part_index}/{total_parts}, pages {part_start_page}-{part_end_page} of {total_pages})"
+                            ),
+                        }
+                    continue
             row: Dict[str, Any] = {
-                "filename": file_path.relative_to(path).as_posix(),
+                "filename": rel_filename,
+                "source_id": rel_filename,
                 "text": "",
                 "input_kind": input_kind,
                 "source_path": str(file_path),
+                "part_index": 1,
+                "part_total": 1,
+                "part_start_page": 1,
+                "part_end_page": None,
+                "document_total_pages": None,
+                "document_part": "",
+                "analysis_filename": rel_filename,
             }
             if include_text and input_kind == "text":
                 row["text"] = file_path.read_text(encoding="utf-8", errors="replace")
@@ -117,16 +163,32 @@ def iter_rows(
             if include_text:
                 yield {
                     "filename": row["filename"],
+                    "source_id": row.get("source_id") or row["filename"],
                     "text": row["text"],
                     "input_kind": "text",
                     "source_path": None,
+                    "part_index": 1,
+                    "part_total": 1,
+                    "part_start_page": 1,
+                    "part_end_page": None,
+                    "document_total_pages": None,
+                    "document_part": "",
+                    "analysis_filename": row["filename"],
                 }
             else:
                 yield {
                     "filename": row["filename"],
+                    "source_id": row.get("source_id") or row["filename"],
                     "text": "",
                     "input_kind": "text",
                     "source_path": None,
+                    "part_index": 1,
+                    "part_total": 1,
+                    "part_start_page": 1,
+                    "part_end_page": None,
+                    "document_total_pages": None,
+                    "document_part": "",
+                    "analysis_filename": row["filename"],
                 }
 
 
@@ -142,6 +204,16 @@ def load_checkpoint(path: Optional[Path]) -> Set[str]:
     return completed
 
 
+def row_source_id(row: Dict[str, Any]) -> str:
+    source_id = row.get("source_id")
+    if isinstance(source_id, str) and source_id.strip():
+        return source_id.strip()
+    filename = row.get("filename")
+    if isinstance(filename, str) and filename.strip():
+        return filename.strip()
+    return ""
+
+
 def load_jsonl_filenames(path: Optional[Path]) -> Set[str]:
     completed: Set[str] = set()
     if not path or not path.exists():
@@ -155,9 +227,19 @@ def load_jsonl_filenames(path: Optional[Path]) -> Set[str]:
                 record = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            source_id = record.get("source_id")
+            if isinstance(source_id, str) and source_id.strip():
+                completed.add(source_id.strip())
+                continue
+            metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+            if isinstance(metadata, dict):
+                meta_source_id = metadata.get("source_id")
+                if isinstance(meta_source_id, str) and meta_source_id.strip():
+                    completed.add(meta_source_id.strip())
+                    continue
             filename = record.get("filename")
-            if filename:
-                completed.add(filename)
+            if isinstance(filename, str) and filename.strip():
+                completed.add(filename.strip())
     return completed
 
 
@@ -339,18 +421,52 @@ def build_skipped_model_result(skip_reason: str) -> Dict[str, Any]:
     }
 
 
-def derive_justice_pdf_url(filename: str, base_url: str = DEFAULT_JUSTICE_FILES_BASE_URL) -> Optional[str]:
-    if not filename:
+def _extract_dataset_number(value: Optional[str]) -> Optional[int]:
+    if not value:
         return None
-    dataset_match = re.search(r"DataSet\s*0*(\d+)", filename, flags=re.IGNORECASE)
-    efta_match = re.search(r"(EFTA\d{8})", filename, flags=re.IGNORECASE)
-    if not dataset_match or not efta_match:
+    text = str(value)
+    dataset_match = re.search(r"DataSet(?:%20|\s)*0*(\d+)", text, flags=re.IGNORECASE)
+    if dataset_match:
+        try:
+            dataset_num = int(dataset_match.group(1))
+            return dataset_num if dataset_num > 0 else None
+        except ValueError:
+            return None
+    volume_match = re.search(
+        r"(?:^|[/_\\-])vol(?:ume)?[_-]?0*(\d{1,5})(?:$|[/_\\-])",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if volume_match:
+        try:
+            dataset_num = int(volume_match.group(1))
+            return dataset_num if dataset_num > 0 else None
+        except ValueError:
+            return None
+    return None
+
+
+def derive_justice_pdf_url(
+    filename: str,
+    base_url: str = DEFAULT_JUSTICE_FILES_BASE_URL,
+    *,
+    source_path: Optional[str] = None,
+    dataset_tag: Optional[str] = None,
+) -> Optional[str]:
+    if not filename and not source_path:
         return None
-    try:
-        dataset_num = int(dataset_match.group(1))
-    except ValueError:
+    efta_source = " ".join(
+        value for value in (filename, source_path) if isinstance(value, str) and value.strip()
+    )
+    efta_match = re.search(r"(EFTA\d{8})", efta_source, flags=re.IGNORECASE)
+    if not efta_match:
         return None
-    if dataset_num < 1:
+    dataset_num = (
+        _extract_dataset_number(filename)
+        or _extract_dataset_number(source_path)
+        or _extract_dataset_number(dataset_tag)
+    )
+    if not dataset_num:
         return None
     efta_id = efta_match.group(1).upper()
     base = base_url.rstrip("/")
@@ -388,6 +504,7 @@ def count_total_rows(
     *,
     input_glob: str = "*.txt",
     processing_mode: str = "auto",
+    pdf_part_pages: int = 0,
 ) -> int:
     """Count total number of source rows for CSV or directory input."""
     if path.is_dir():
@@ -398,6 +515,7 @@ def count_total_rows(
                 input_glob=input_glob,
                 include_text=False,
                 processing_mode=processing_mode,
+                pdf_part_pages=pdf_part_pages,
             )
         )
     with path.open(newline="", encoding="utf-8") as handle:
@@ -410,6 +528,7 @@ def calculate_workload(
     *,
     input_glob: str,
     processing_mode: str,
+    pdf_part_pages: int,
     max_rows: Optional[int],
     completed_filenames: Set[str],
     start_row: int,
@@ -424,6 +543,7 @@ def calculate_workload(
             input_glob=input_glob,
             include_text=False,
             processing_mode=processing_mode,
+            pdf_part_pages=pdf_part_pages,
         ),
         start=1,
     ):
@@ -432,7 +552,8 @@ def calculate_workload(
         if end_row is not None and idx > end_row:
             break
         total += 1
-        if completed_filenames and row.get("filename") in completed_filenames:
+        row_id = row_source_id(row)
+        if completed_filenames and row_id in completed_filenames:
             already_done += 1
         else:
             workload += 1
@@ -656,6 +777,8 @@ def build_config_metadata(args: argparse.Namespace, prompt_source: str) -> Dict[
         "max_retries": args.max_retries,
         "retry_backoff": args.retry_backoff,
         "image_max_pages": args.image_max_pages,
+        "pdf_pages_per_image": args.pdf_pages_per_image,
+        "pdf_part_pages": args.pdf_part_pages,
         "image_render_dpi": args.image_render_dpi,
         "image_detail": args.image_detail,
         "prompt_source": prompt_source,
@@ -910,8 +1033,18 @@ def build_output_records(
     processing_status: str,
     skip_reason: str,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    source_id = row_source_id(source_row)
+    part_index = source_row.get("part_index")
+    part_total = source_row.get("part_total")
+    part_start_page = source_row.get("part_start_page")
+    part_end_page = source_row.get("part_end_page")
+    document_total_pages = source_row.get("document_total_pages")
+    document_part = source_row.get("document_part") or ""
     justice_source_url = derive_justice_pdf_url(
-        source_row.get("filename", ""), base_url=args.justice_files_base_url
+        source_row.get("filename", ""),
+        base_url=args.justice_files_base_url,
+        source_path=source_row.get("source_path"),
+        dataset_tag=getattr(args, "dataset_tag", None),
     )
     local_source_url = derive_local_source_url(
         source_row.get("source_path"),
@@ -935,7 +1068,14 @@ def build_output_records(
     )
 
     csv_row = {
+        "source_id": source_id,
         "filename": source_row["filename"],
+        "document_part": document_part,
+        "part_index": part_index if part_index is not None else "",
+        "part_total": part_total if part_total is not None else "",
+        "part_start_page": part_start_page if part_start_page is not None else "",
+        "part_end_page": part_end_page if part_end_page is not None else "",
+        "document_total_pages": document_total_pages if document_total_pages is not None else "",
         "source_row_index": idx,
         "source_pdf_url": source_url or "",
         "processing_status": processing_status,
@@ -953,7 +1093,14 @@ def build_output_records(
         csv_row["action_items"] = "; ".join(action_items)
 
     json_record: Dict[str, Any] = {
+        "source_id": source_id,
         "filename": source_row["filename"],
+        "document_part": document_part,
+        "part_index": part_index,
+        "part_total": part_total,
+        "part_start_page": part_start_page,
+        "part_end_page": part_end_page,
+        "document_total_pages": document_total_pages,
         "source_pdf_url": source_url,
         "headline": result.get("headline", ""),
         "importance_score": result.get("importance_score", ""),
@@ -965,6 +1112,13 @@ def build_output_records(
         "lead_types": lead_types,
         "metadata": {
             "source_row_index": idx,
+            "source_id": source_id,
+            "document_part": document_part,
+            "part_index": part_index,
+            "part_total": part_total,
+            "part_start_page": part_start_page,
+            "part_end_page": part_end_page,
+            "document_total_pages": document_total_pages,
             "original_row": source_row,
             "config": config_metadata,
             "source_pdf_url": source_url,
@@ -991,6 +1145,7 @@ def resolve_processing_mode(args: argparse.Namespace) -> str:
         input_glob=args.input_glob,
         include_text=False,
         processing_mode="auto",
+        pdf_part_pages=getattr(args, "pdf_part_pages", 0),
     ):
         return row.get("input_kind", "text")
 
@@ -1053,6 +1208,10 @@ def main() -> None:
         sys.exit("--max-repeated-char-run must be >= 1")
     if args.image_max_pages < 1:
         sys.exit("--image-max-pages must be >= 1")
+    if args.pdf_pages_per_image < 1:
+        sys.exit("--pdf-pages-per-image must be >= 1")
+    if args.pdf_part_pages < 0:
+        sys.exit("--pdf-part-pages must be >= 0")
     if args.image_render_dpi < 72:
         sys.exit("--image-render-dpi must be >= 72")
     if args.max_output_tokens < 1:
@@ -1101,9 +1260,18 @@ def main() -> None:
             print("Image mode detected: skipping text-quality prefilter checks.", flush=True)
         print(
             f"Processing mode: image | glob: {args.input_glob} | "
-            f"PDF pages per file: {args.image_max_pages} | render DPI: {args.image_render_dpi}",
+            f"PDF pages per file: {args.image_max_pages} | "
+            f"pages per image: {args.pdf_pages_per_image} | "
+            f"split part pages: {args.pdf_part_pages if args.pdf_part_pages > 0 else 'disabled'} | "
+            f"render DPI: {args.image_render_dpi}",
             flush=True,
         )
+        if args.pdf_part_pages > 0:
+            print(
+                "PDF split mode enabled: each part is processed as an independent record "
+                f"using windows of up to {args.pdf_part_pages} page(s).",
+                flush=True,
+            )
         if (
             "vl" not in args.model.lower()
             and "vision" not in args.model.lower()
@@ -1121,7 +1289,14 @@ def main() -> None:
     )
 
     fieldnames = [
+        "source_id",
         "filename",
+        "document_part",
+        "part_index",
+        "part_total",
+        "part_start_page",
+        "part_end_page",
+        "document_total_pages",
         "source_row_index",
         "source_pdf_url",
         "processing_status",
@@ -1139,21 +1314,22 @@ def main() -> None:
         fieldnames.append("action_items")
 
     processed = 0
-    completed_filenames: Set[str] = set()
+    completed_source_ids: Set[str] = set()
     if args.resume:
-        completed_filenames |= load_checkpoint(args.checkpoint)
-        completed_filenames |= load_jsonl_filenames(args.json_output)
+        completed_source_ids |= load_checkpoint(args.checkpoint)
+        completed_source_ids |= load_jsonl_filenames(args.json_output)
     for extra_json in args.known_json:
-        completed_filenames |= load_jsonl_filenames(Path(extra_json))
-    if completed_filenames:
-        print(f"Skipping {len(completed_filenames)} pre-processed files.")
+        completed_source_ids |= load_jsonl_filenames(Path(extra_json))
+    if completed_source_ids:
+        print(f"Skipping {len(completed_source_ids)} pre-processed source ids.")
 
     workload_stats = calculate_workload(
         args.input,
         input_glob=args.input_glob,
         processing_mode=active_processing_mode,
+        pdf_part_pages=args.pdf_part_pages,
         max_rows=args.max_rows,
-        completed_filenames=completed_filenames if args.resume else set(),
+        completed_filenames=completed_source_ids if args.resume else set(),
         start_row=args.start_row,
         end_row=args.end_row,
     )
@@ -1179,6 +1355,7 @@ def main() -> None:
             args.input,
             input_glob=args.input_glob,
             processing_mode=active_processing_mode,
+            pdf_part_pages=args.pdf_part_pages,
         )
         total_dataset_rows = output_router.total_dataset_rows
         print(f"Total dataset: {output_router.total_dataset_rows:,} rows")
@@ -1188,6 +1365,7 @@ def main() -> None:
             args.input,
             input_glob=args.input_glob,
             processing_mode=active_processing_mode,
+            pdf_part_pages=args.pdf_part_pages,
         )
 
     checkpoint_handle = (
@@ -1256,8 +1434,9 @@ def main() -> None:
             outcome = pending_results.pop(row_idx)
             if outcome["type"] == "error":
                 failed += 1
+                row_ref = row_source_id(outcome["row"]) or outcome["row"].get("filename", "")
                 print(
-                    f"  ! Failed to analyze {outcome['row']['filename']}: {outcome['error']}",
+                    f"  ! Failed to analyze {row_ref}: {outcome['error']}",
                     file=sys.stderr,
                 )
                 continue
@@ -1274,11 +1453,11 @@ def main() -> None:
             )
             output_router.write(row_idx, csv_row, json_record)
 
-            filename = outcome["row"]["filename"]
+            row_key = row_source_id(outcome["row"])
             if checkpoint_handle:
-                checkpoint_handle.write(filename + "\n")
+                checkpoint_handle.write(row_key + "\n")
                 checkpoint_handle.flush()
-            completed_filenames.add(filename)
+            completed_source_ids.add(row_key)
             processed += 1
             if outcome["processing_status"] == "skipped":
                 skipped += 1
@@ -1330,6 +1509,7 @@ def main() -> None:
                 input_glob=args.input_glob,
                 include_text=True,
                 processing_mode=active_processing_mode,
+                pdf_part_pages=args.pdf_part_pages,
             ),
             start=1,
         ):
@@ -1341,12 +1521,13 @@ def main() -> None:
                 break
 
             filename = row["filename"]
+            source_id = row_source_id(row)
             text = row["text"]
             input_kind = row.get("input_kind", "text")
             source_path = Path(row["source_path"]) if row.get("source_path") else None
 
-            if filename in completed_filenames:
-                print(f"[Row {idx}] [skip] {filename} already processed.", flush=True)
+            if source_id in completed_source_ids:
+                print(f"[Row {idx}] [skip] {source_id} already processed.", flush=True)
                 continue
 
             scheduled += 1
@@ -1369,7 +1550,7 @@ def main() -> None:
                 }
                 skip_reason = None
             if skip_reason:
-                print(f"[Row {idx}] [skip] {filename}: {skip_reason}", flush=True)
+                print(f"[Row {idx}] [skip] {source_id}: {skip_reason}", flush=True)
                 pending_results[idx] = {
                     "type": "record",
                     "row": row,
@@ -1395,17 +1576,37 @@ def main() -> None:
                 args.power_watts,
                 args.electric_rate,
             )
-            print(f"{progress_prefix} Processing {filename}... {eta_text}", flush=True)
+            display_name = row.get("document_part") or filename
+            print(f"{progress_prefix} Processing {display_name}... {eta_text}", flush=True)
+
+            part_start_page = row.get("part_start_page")
+            part_end_page = row.get("part_end_page")
+            if (
+                isinstance(part_start_page, int)
+                and isinstance(part_end_page, int)
+                and part_end_page >= part_start_page
+            ):
+                effective_image_max_pages = part_end_page - part_start_page + 1
+            else:
+                effective_image_max_pages = args.image_max_pages
 
             request_kwargs = {
                 "endpoint": args.endpoint,
                 "api_format": args.api_format,
                 "model": args.model,
-                "filename": filename,
+                "filename": row.get("analysis_filename") or filename,
                 "text": text,
                 "input_kind": input_kind,
                 "image_path": source_path if input_kind == "image" else None,
-                "image_max_pages": args.image_max_pages,
+                "image_max_pages": effective_image_max_pages,
+                "pdf_pages_per_image": args.pdf_pages_per_image,
+                "image_start_page": int(row.get("part_start_page") or 1),
+                "image_part_index": (
+                    int(row["part_index"]) if row.get("part_index") is not None else None
+                ),
+                "image_part_total": (
+                    int(row["part_total"]) if row.get("part_total") is not None else None
+                ),
                 "image_render_dpi": args.image_render_dpi,
                 "system_prompt": system_prompt,
                 "api_key": args.api_key,
@@ -1449,11 +1650,19 @@ def main() -> None:
                     endpoint=args.endpoint,
                     api_format=args.api_format,
                     model=args.model,
-                    filename=filename,
+                    filename=row.get("analysis_filename") or filename,
                     text=text,
                     input_kind=input_kind,
                     image_path=source_path if input_kind == "image" else None,
-                    image_max_pages=args.image_max_pages,
+                    image_max_pages=effective_image_max_pages,
+                    pdf_pages_per_image=args.pdf_pages_per_image,
+                    image_start_page=int(row.get("part_start_page") or 1),
+                    image_part_index=(
+                        int(row["part_index"]) if row.get("part_index") is not None else None
+                    ),
+                    image_part_total=(
+                        int(row["part_total"]) if row.get("part_total") is not None else None
+                    ),
                     image_render_dpi=args.image_render_dpi,
                     system_prompt=system_prompt,
                     api_key=args.api_key,
