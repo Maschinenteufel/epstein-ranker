@@ -306,6 +306,45 @@ class GptRankerHelpersTest(unittest.TestCase):
         self.assertEqual(args.chunk_dir, Path("/tmp/chunks"))
         self.assertEqual(args.known_json, ["keep.jsonl"])
 
+    def test_load_resume_completed_ids_ignores_checkpoint_without_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            checkpoint = root / ".checkpoint"
+            checkpoint.write_text("IMAGES/0001/EFTA00000001.pdf\n", encoding="utf-8")
+            args = argparse.Namespace(
+                resume=True,
+                checkpoint=checkpoint,
+                json_output=root / "results.jsonl",
+                known_json=[],
+                chunk_size=1000,
+                chunk_dir=root / "chunks",
+            )
+            completed = gpt_ranker.load_resume_completed_ids(args)
+        self.assertEqual(completed, set())
+
+    def test_load_resume_completed_ids_uses_chunk_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            chunk_dir = root / "chunks"
+            chunk_dir.mkdir(parents=True)
+            chunk_file = chunk_dir / "epstein_ranked_00001_01000.jsonl"
+            chunk_file.write_text(
+                '{"source_id":"IMAGES/0001/EFTA00000001.pdf","filename":"IMAGES/0001/EFTA00000001.pdf"}\n',
+                encoding="utf-8",
+            )
+            checkpoint = root / ".checkpoint"
+            checkpoint.write_text("STALE_ROW_ID\n", encoding="utf-8")
+            args = argparse.Namespace(
+                resume=True,
+                checkpoint=checkpoint,
+                json_output=root / "results.jsonl",
+                known_json=[],
+                chunk_size=1000,
+                chunk_dir=chunk_dir,
+            )
+            completed = gpt_ranker.load_resume_completed_ids(args)
+        self.assertEqual(completed, {"IMAGES/0001/EFTA00000001.pdf"})
+
     def test_write_run_metadata_writes_profile(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             run_file = Path(tmpdir) / "meta" / "run.json"

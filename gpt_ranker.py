@@ -243,6 +243,48 @@ def load_jsonl_filenames(path: Optional[Path]) -> Set[str]:
     return completed
 
 
+def load_chunk_source_ids(chunk_dir: Path) -> Set[str]:
+    completed: Set[str] = set()
+    if not chunk_dir.exists():
+        return completed
+    for chunk_path in sorted(chunk_dir.glob("epstein_ranked_*.jsonl")):
+        if not chunk_path.is_file():
+            continue
+        completed |= load_jsonl_filenames(chunk_path)
+    return completed
+
+
+def load_resume_completed_ids(args: argparse.Namespace) -> Set[str]:
+    completed_source_ids: Set[str] = set()
+    output_backed_ids: Set[str] = set()
+
+    checkpoint_ids: Set[str] = set()
+    if args.resume:
+        checkpoint_ids = load_checkpoint(args.checkpoint)
+        output_backed_ids |= load_jsonl_filenames(args.json_output)
+        if args.chunk_size > 0:
+            output_backed_ids |= load_chunk_source_ids(args.chunk_dir)
+        if checkpoint_ids:
+            if not output_backed_ids:
+                print(
+                    "Resume checkpoint exists but no output records were found; "
+                    "ignoring checkpoint entries so rows can be reprocessed.",
+                    flush=True,
+                )
+            else:
+                stale_checkpoint_ids = len(checkpoint_ids - output_backed_ids)
+                if stale_checkpoint_ids > 0:
+                    print(
+                        f"Ignoring {stale_checkpoint_ids} checkpoint-only ids not present in output records.",
+                        flush=True,
+                    )
+        completed_source_ids |= output_backed_ids
+
+    for extra_json in args.known_json:
+        completed_source_ids |= load_jsonl_filenames(Path(extra_json))
+    return completed_source_ids
+
+
 def ensure_list(value: Any) -> List[str]:
     if value is None:
         return []
@@ -1314,12 +1356,7 @@ def main() -> None:
         fieldnames.append("action_items")
 
     processed = 0
-    completed_source_ids: Set[str] = set()
-    if args.resume:
-        completed_source_ids |= load_checkpoint(args.checkpoint)
-        completed_source_ids |= load_jsonl_filenames(args.json_output)
-    for extra_json in args.known_json:
-        completed_source_ids |= load_jsonl_filenames(Path(extra_json))
+    completed_source_ids: Set[str] = load_resume_completed_ids(args)
     if completed_source_ids:
         print(f"Skipping {len(completed_source_ids)} pre-processed source ids.")
 
