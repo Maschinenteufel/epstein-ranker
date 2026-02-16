@@ -40,7 +40,8 @@ Status as of **February 16, 2026**:
 
 Primary corpus (active):
 
-- StandardWorks File Transparency Act index: <https://standardworks.ai/epstein-files>
+- Raw PDF source repo (used for local volume downloads): <https://github.com/yung-megafone/Epstein-Files>
+- StandardWorks File Transparency Act index (text/index reference): <https://standardworks.ai/epstein-files>
 - Local data root: `data/new_data/VOL00001...`
 - Dataset profile metadata: `data/dataset_profiles/standardworks_epstein_files.json`
 - DOJ source links are generated using `--justice-files-base-url` and stored per record (`source_pdf_url`).
@@ -60,7 +61,7 @@ Both corpora include sensitive material (abuse, trafficking, violence, unverifie
 - `requests`
 - LM Studio (or another local gateway) serving your selected model locally (for vision runs: `qwen/qwen3-vl-30b` via OpenAI-compatible `http://localhost:5555/v1`)
 - Optional hosted provider: OpenRouter (`https://openrouter.ai/api/v1`) with API key
-- For the active FTA workflow: downloaded volume folders under `data/new_data/` (for example `VOL00001`, `VOL00002`, ...).
+- For the active FTA workflow: downloaded volume folders under `data/new_data/` (for example `VOL00001`, `VOL00002`, ...) from the repo above.
 - Optional legacy text workflow: `data/EPS_FILES_20K_NOV2026.csv` from the Hugging Face link above.
 
 Install Python deps (only `requests` is needed):
@@ -194,8 +195,8 @@ python gpt_ranker.py \
   --processing-mode image \
   --dataset-workspace-root data/workspaces \
   --dataset-tag standardworks_epstein_files_vol00001 \
-  --dataset-source-label "StandardWorks Epstein Files" \
-  --dataset-source-url "https://standardworks.ai/epstein-files" \
+  --dataset-source-label "Epstein-Files GitHub (raw PDFs)" \
+  --dataset-source-url "https://github.com/yung-megafone/Epstein-Files" \
   --dataset-metadata-file data/dataset_profiles/standardworks_epstein_files.json \
   --max-parallel-requests 4 \
   --resume

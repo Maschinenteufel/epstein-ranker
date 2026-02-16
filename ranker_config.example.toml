@@ -65,8 +65,8 @@ checkpoint = "data/.epstein_checkpoint"
 # <dataset_workspace_root>/<dataset_tag>/
 # dataset_workspace_root = "data/workspaces"
 # dataset_tag = "standardworks_epstein_files"
-# dataset_source_label = "StandardWorks Epstein Files"
-# dataset_source_url = "https://standardworks.ai/epstein-files"
+# dataset_source_label = "Epstein-Files GitHub (raw PDFs)"
+# dataset_source_url = "https://github.com/yung-megafone/Epstein-Files"
 # dataset_metadata_file = "data/dataset_profiles/standardworks_epstein_files.json"
 # run_metadata_file can be omitted in workspace mode (auto-generated in metadata/run_metadata.json)
 # Example: reference other JSONL files to skip duplicates
