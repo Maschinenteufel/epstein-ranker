@@ -746,6 +746,30 @@ def extract_response_usage(data: Dict[str, Any]) -> Tuple[Dict[str, int], Option
     return normalized_usage, provider_reported_cost_usd
 
 
+def _normalize_provider_label(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+
+def _provider_matches_expected(actual_provider: str, expected_provider: str) -> bool:
+    actual = _normalize_provider_label(actual_provider)
+    expected = expected_provider.strip().lower()
+    expected_candidates = [expected]
+    if "/" in expected:
+        left, right = expected.split("/", 1)
+        expected_candidates.extend([left, right])
+    for candidate in expected_candidates:
+        normalized_candidate = _normalize_provider_label(candidate)
+        if not normalized_candidate:
+            continue
+        if (
+            actual == normalized_candidate
+            or actual.startswith(normalized_candidate)
+            or normalized_candidate.startswith(actual)
+        ):
+            return True
+    return False
+
+
 def call_model(
     *,
     endpoint: str,
@@ -896,6 +920,8 @@ def call_model(
                             provider_preferences["allow_fallbacks"] = bool(
                                 openrouter_allow_fallbacks
                             )
+                        if normalized_openrouter_provider and openrouter_allow_fallbacks is False:
+                            provider_preferences["only"] = [normalized_openrouter_provider]
                         if not provider_preferences:
                             provider_preferences = None
                     if provider_preferences:
@@ -904,6 +930,31 @@ def call_model(
                     data = send_request(url=f"{base_url}/chat/completions", payload=payload)
                     request_seconds = time.monotonic() - request_started
                     usage, provider_reported_cost_usd = extract_response_usage(data)
+                    response_provider = (
+                        str(data.get("provider")).strip()
+                        if isinstance(data.get("provider"), str)
+                        else None
+                    )
+                    if (
+                        "openrouter.ai" in base_url
+                        and normalized_openrouter_provider
+                        and openrouter_allow_fallbacks is False
+                    ):
+                        if not response_provider:
+                            raise ModelRequestError(
+                                "OpenRouter strict provider mode requires a provider label in "
+                                "response, but none was returned.",
+                                retriable=False,
+                            )
+                        if not _provider_matches_expected(
+                            response_provider,
+                            normalized_openrouter_provider,
+                        ):
+                            raise ModelRequestError(
+                                "OpenRouter strict provider mismatch: expected "
+                                f"'{normalized_openrouter_provider}', got '{response_provider}'.",
+                                retriable=False,
+                            )
                     content = extract_openai_content(data)
                 else:
                     payload = {
@@ -912,6 +963,7 @@ def call_model(
                         "input": doc_input,
                     }
                     provider_preferences = None
+                    response_provider = None
                     request_started = time.monotonic()
                     data = send_request(url=f"{base_url}/chat", payload=payload)
                     request_seconds = time.monotonic() - request_started
@@ -932,6 +984,7 @@ def call_model(
                         "usage": usage,
                         "provider_reported_cost_usd": provider_reported_cost_usd,
                         "provider_preferences": provider_preferences,
+                        "provider": response_provider,
                     }
                     return parsed
                 except (json.JSONDecodeError, TypeError, ValueError) as exc:

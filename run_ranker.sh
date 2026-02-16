@@ -34,8 +34,8 @@ OPENROUTER_MODEL="qwen/qwen3-vl-30b-a3b-instruct"
 OPENROUTER_API_KEY="${OPENROUTER_API_KEY:-}"
 OPENROUTER_REFERER="${OPENROUTER_REFERER:-}"
 OPENROUTER_TITLE="${OPENROUTER_TITLE:-Epstein File Ranker}"
-OPENROUTER_PROVIDER="${OPENROUTER_PROVIDER:-}"
-OPENROUTER_NO_FALLBACKS="${OPENROUTER_NO_FALLBACKS:-0}"
+OPENROUTER_PROVIDER="${OPENROUTER_PROVIDER:-alibaba}"
+OPENROUTER_NO_FALLBACKS="${OPENROUTER_NO_FALLBACKS:-1}"
 API_KEY=""
 HTTP_REFERER=""
 X_TITLE=""
@@ -106,10 +106,10 @@ Model/runtime options:
   --openrouter-api-key KEY   OpenRouter key (or set OPENROUTER_API_KEY)
   --openrouter-referer URL   OpenRouter referer override (or OPENROUTER_REFERER)
   --openrouter-title NAME    OpenRouter title override (or OPENROUTER_TITLE)
-  --openrouter-provider ID   OpenRouter provider slug/name (example: alibaba)
-  --openrouter-no-fallbacks  Disable OpenRouter provider fallback routing
+  --openrouter-provider ID   OpenRouter provider slug/name (default: alibaba)
+  --openrouter-no-fallbacks  Disable OpenRouter provider fallback routing (default)
   --openrouter-allow-fallbacks
-                             Allow OpenRouter provider fallback routing (default)
+                             Allow OpenRouter provider fallback routing
   --parallel N               Max parallel requests (default: 4)
   --parallel-scheduling MODE auto | window | batch (default: batch)
   --image-prefetch N         Extra queued image tasks beyond --parallel (default: 0)
@@ -334,8 +334,8 @@ while [[ $# -gt 0 ]]; do
       OPENROUTER_API_KEY="${OPENROUTER_API_KEY:-}"
       OPENROUTER_REFERER="${OPENROUTER_REFERER:-}"
       OPENROUTER_TITLE="${OPENROUTER_TITLE:-Epstein File Ranker}"
-      OPENROUTER_PROVIDER="${OPENROUTER_PROVIDER:-}"
-      OPENROUTER_NO_FALLBACKS="${OPENROUTER_NO_FALLBACKS:-0}"
+      OPENROUTER_PROVIDER="${OPENROUTER_PROVIDER:-alibaba}"
+      OPENROUTER_NO_FALLBACKS="${OPENROUTER_NO_FALLBACKS:-1}"
       shift 2
       ;;
     --openrouter-api-key)
