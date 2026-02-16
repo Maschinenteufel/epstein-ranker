@@ -216,6 +216,24 @@ def parse_args() -> argparse.Namespace:
         help="Maximum concurrent model requests.",
     )
     parser.add_argument(
+        "--parallel-scheduling",
+        choices=["auto", "window", "batch"],
+        default="auto",
+        help=(
+            "Scheduler style for concurrent work: window keeps slots full continuously; "
+            "batch waits for a full group to finish before submitting next group."
+        ),
+    )
+    parser.add_argument(
+        "--image-prefetch",
+        type=int,
+        default=0,
+        help=(
+            "Extra queued image tasks (render/prep) beyond --max-parallel-requests "
+            "to keep local pipelines saturated."
+        ),
+    )
+    parser.add_argument(
         "--temperature",
         type=float,
         default=0.0,

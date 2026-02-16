@@ -78,9 +78,9 @@ Recommended (FTA image/PDF workflow): use the helper script.
 ```bash
 ./run_ranker.sh --volumes 1
 ./run_ranker.sh --provider openrouter --openrouter-api-key sk-or-... --volumes 1 --parallel 2
-./run_ranker.sh --volumes 1,2,6-7 --parallel 4
+./run_ranker.sh --volumes 1,2,6-7 --parallel 4 --parallel-scheduling batch
 ./run_ranker.sh --volumes 1-12 --dry-run
-./run_ranker.sh --volumes all -- --reasoning-effort low --sleep 0.5
+./run_ranker.sh --volumes all -- --reasoning-effort low
 ```
 
 OpenRouter key file (recommended):
@@ -147,6 +147,8 @@ Notable flags:
 - `--checkpoint data/.epstein_checkpoint`: stores processed filenames to guard against duplication.
 - `--reasoning-effort low/high`: trade accuracy for speed if your model exposes the reasoning control knob.
 - `--max-parallel-requests`: number of concurrent requests to LM Studio (default `4`).
+- `--parallel-scheduling`: `batch` (submit N, wait all N, then next N) or `window` (continuous refill). `run_ranker.sh` defaults to `batch`.
+- `--image-prefetch`: queue extra image render/prep tasks beyond active requests (used with `window` scheduling).
 - `--max-output-tokens`: hard cap for completion length per request (useful to stop runaway outputs).
 - `--api-key`, `--http-referer`, `--x-title`: auth and optional headers for hosted OpenAI-compatible endpoints (including OpenRouter).
 - `--api-format`: `auto` (default), `openai`, or `chat`. Vision/image mode requires `openai` (or `auto`, which resolves to OpenAI format).

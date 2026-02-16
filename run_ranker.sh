@@ -40,11 +40,14 @@ X_TITLE=""
 MODEL_EXPLICIT=0
 ENDPOINT_EXPLICIT=0
 MAX_PARALLEL_REQUESTS=4
+PARALLEL_SCHEDULING="batch"
+IMAGE_PREFETCH=0
 IMAGE_MAX_PAGES=1
 IMAGE_RENDER_DPI=120
 IMAGE_DETAIL="low"
 MAX_OUTPUT_TOKENS=900
 TEMPERATURE=0.0
+SLEEP_SECONDS=0
 CHUNK_SIZE=1000
 MAX_ROWS=""
 
@@ -83,11 +86,14 @@ Model/runtime options:
   --openrouter-referer URL   OpenRouter referer override (or OPENROUTER_REFERER)
   --openrouter-title NAME    OpenRouter title override (or OPENROUTER_TITLE)
   --parallel N               Max parallel requests (default: 4)
+  --parallel-scheduling MODE auto | window | batch (default: batch)
+  --image-prefetch N         Extra queued image tasks beyond --parallel (default: 0)
   --image-max-pages N        Max rendered PDF pages per document (default: 1)
   --image-render-dpi N       PDF render DPI (default: 120)
   --image-detail MODE        auto | low | high (default: low)
   --max-output-tokens N      Max completion tokens per request (default: 900)
   --temperature FLOAT        Sampling temperature (default: 0.0)
+  --sleep SECONDS            Delay between submissions (default: 0)
   --chunk-size N             Output chunk size (default: 1000)
   --max-rows N               Limit rows for smoke test per volume
 
@@ -307,6 +313,14 @@ while [[ $# -gt 0 ]]; do
       MAX_PARALLEL_REQUESTS="$2"
       shift 2
       ;;
+    --parallel-scheduling)
+      PARALLEL_SCHEDULING="$2"
+      shift 2
+      ;;
+    --image-prefetch)
+      IMAGE_PREFETCH="$2"
+      shift 2
+      ;;
     --image-max-pages)
       IMAGE_MAX_PAGES="$2"
       shift 2
@@ -325,6 +339,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --temperature)
       TEMPERATURE="$2"
+      shift 2
+      ;;
+    --sleep)
+      SLEEP_SECONDS="$2"
       shift 2
       ;;
     --chunk-size)
@@ -451,11 +469,14 @@ for vol in "${VOLUMES[@]}"; do
     --api-format "$API_FORMAT"
     --model "$MODEL"
     --max-parallel-requests "$MAX_PARALLEL_REQUESTS"
+    --parallel-scheduling "$PARALLEL_SCHEDULING"
+    --image-prefetch "$IMAGE_PREFETCH"
     --image-max-pages "$IMAGE_MAX_PAGES"
     --image-render-dpi "$IMAGE_RENDER_DPI"
     --image-detail "$IMAGE_DETAIL"
     --max-output-tokens "$MAX_OUTPUT_TOKENS"
     --temperature "$TEMPERATURE"
+    --sleep "$SLEEP_SECONDS"
     --chunk-size "$CHUNK_SIZE"
   )
 

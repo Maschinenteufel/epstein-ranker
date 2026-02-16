@@ -71,6 +71,13 @@
         <select id="datasetSelector"></select>
       </div>
 
+      <div class="control-group hidden" id="volumeFilterGroup">
+        <label for="volumeFilter">Volume</label>
+        <select id="volumeFilter">
+          <option value="__all__">All volumes</option>
+        </select>
+      </div>
+
       <div class="control-group">
         <label for="scoreFilter">Minimum Importance Score: <span id="scoreValue">0</span></label>
         <input type="range" id="scoreFilter" min="0" max="100" value="0" step="1" />

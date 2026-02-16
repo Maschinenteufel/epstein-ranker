@@ -9,6 +9,7 @@ import csv
 import json
 import re
 import sys
+import threading
 import time
 from collections import deque
 from pathlib import Path
@@ -1026,6 +1027,10 @@ def main() -> None:
         sys.exit(f"Dataset metadata file not found: {args.dataset_metadata_file}")
     if args.max_parallel_requests < 1:
         sys.exit("--max-parallel-requests must be >= 1")
+    if args.image_prefetch < 0:
+        sys.exit("--image-prefetch must be >= 0")
+    if args.parallel_scheduling not in {"auto", "window", "batch"}:
+        sys.exit("--parallel-scheduling must be one of: auto, window, batch")
     if args.max_retries < 1:
         sys.exit("--max-retries must be >= 1")
     if args.retry_backoff < 0:
@@ -1205,6 +1210,28 @@ def main() -> None:
     )
 
     start_time = time.monotonic()
+    parallel_scheduling = args.parallel_scheduling
+    if parallel_scheduling == "auto":
+        parallel_scheduling = "batch" if active_processing_mode == "image" else "window"
+    if parallel_scheduling == "batch":
+        max_in_flight_tasks = args.max_parallel_requests
+    else:
+        max_in_flight_tasks = args.max_parallel_requests + (
+            args.image_prefetch if active_processing_mode == "image" else 0
+        )
+    print(
+        "Parallel scheduling: "
+        f"{parallel_scheduling} | request limit: {args.max_parallel_requests}"
+        + (f" | task queue: {max_in_flight_tasks}" if max_in_flight_tasks != args.max_parallel_requests else "")
+    )
+    if parallel_scheduling == "batch" and args.image_prefetch > 0:
+        print("Image prefetch ignored in batch scheduling mode.")
+    elif active_processing_mode == "image" and args.image_prefetch > 0:
+        print(
+            "Image prefetch enabled: "
+            f"{args.max_parallel_requests} concurrent request(s) + "
+            f"{args.image_prefetch} queued prefetch task(s)."
+        )
     emit_order: Deque[int] = deque()
     pending_results: Dict[int, Dict[str, Any]] = {}
     in_flight: Dict[concurrent.futures.Future[Dict[str, Any]], Dict[str, Any]] = {}
@@ -1213,9 +1240,12 @@ def main() -> None:
     failed = 0
     model_scored = 0
     interrupted = False
+    request_semaphore: Optional[threading.Semaphore] = None
+    if max_in_flight_tasks > 1:
+        request_semaphore = threading.BoundedSemaphore(args.max_parallel_requests)
     executor = (
-        concurrent.futures.ThreadPoolExecutor(max_workers=args.max_parallel_requests)
-        if args.max_parallel_requests > 1
+        concurrent.futures.ThreadPoolExecutor(max_workers=max_in_flight_tasks)
+        if max_in_flight_tasks > 1
         else None
     )
 
@@ -1255,14 +1285,18 @@ def main() -> None:
             else:
                 model_scored += 1
 
-    def harvest_completed(*, block: bool) -> None:
+    def harvest_completed(*, block: bool, wait_for_all: bool = False) -> None:
         if not in_flight:
             return
         timeout = None if block else 0
         done, _ = concurrent.futures.wait(
             set(in_flight.keys()),
             timeout=timeout,
-            return_when=concurrent.futures.FIRST_COMPLETED,
+            return_when=(
+                concurrent.futures.ALL_COMPLETED
+                if wait_for_all
+                else concurrent.futures.FIRST_COMPLETED
+            ),
         )
         if not done:
             return
@@ -1382,6 +1416,7 @@ def main() -> None:
                 "max_output_tokens": args.max_output_tokens,
                 "reasoning_effort": args.reasoning_effort,
                 "image_detail": args.image_detail,
+                "request_semaphore": request_semaphore,
                 "http_referer": args.http_referer,
                 "x_title": args.x_title,
                 "config_metadata": config_metadata,
@@ -1406,8 +1441,9 @@ def main() -> None:
                     }
                 flush_ready()
             else:
-                while len(in_flight) >= args.max_parallel_requests:
-                    harvest_completed(block=True)
+                if parallel_scheduling == "window":
+                    while len(in_flight) >= max_in_flight_tasks:
+                        harvest_completed(block=True)
                 future = executor.submit(
                     call_model,
                     endpoint=args.endpoint,
@@ -1428,18 +1464,22 @@ def main() -> None:
                     max_output_tokens=args.max_output_tokens,
                     reasoning_effort=args.reasoning_effort,
                     image_detail=args.image_detail,
+                    request_semaphore=request_semaphore,
                     http_referer=args.http_referer,
                     x_title=args.x_title,
                     config_metadata=config_metadata,
                 )
                 in_flight[future] = {"idx": idx, "row": row, "quality": quality}
-                harvest_completed(block=False)
+                if parallel_scheduling == "window":
+                    harvest_completed(block=False)
+                elif len(in_flight) >= args.max_parallel_requests:
+                    harvest_completed(block=True, wait_for_all=True)
 
             if args.sleep:
                 time.sleep(args.sleep)
 
         while in_flight:
-            harvest_completed(block=True)
+            harvest_completed(block=True, wait_for_all=(parallel_scheduling == "batch"))
 
         flush_ready()
     except KeyboardInterrupt:

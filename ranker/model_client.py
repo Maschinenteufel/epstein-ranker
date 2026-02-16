@@ -5,6 +5,7 @@ import json
 import re
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -297,6 +298,7 @@ def call_model(
     max_output_tokens: int,
     reasoning_effort: Optional[str],
     image_detail: str,
+    request_semaphore: Optional[threading.Semaphore] = None,
     http_referer: Optional[str] = None,
     x_title: Optional[str] = None,
     config_metadata: Optional[Dict[str, Any]] = None,
@@ -336,6 +338,27 @@ def call_model(
         saw_retriable_error = False
         for mode, base_url in targets:
             try:
+                def send_request(*, url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+                    if request_semaphore is None:
+                        return post_request(
+                            url=url,
+                            payload=payload,
+                            api_key=api_key,
+                            extra_headers=extra_headers or None,
+                            timeout=timeout,
+                        )
+                    request_semaphore.acquire()
+                    try:
+                        return post_request(
+                            url=url,
+                            payload=payload,
+                            api_key=api_key,
+                            extra_headers=extra_headers or None,
+                            timeout=timeout,
+                        )
+                    finally:
+                        request_semaphore.release()
+
                 if mode == "openai":
                     user_content: Any
                     if input_kind == "image":
@@ -363,13 +386,7 @@ def call_model(
                         payload["reasoning"] = {"effort": reasoning_effort}
                     if config_metadata:
                         payload["metadata"] = config_metadata
-                    data = post_request(
-                        url=f"{base_url}/chat/completions",
-                        payload=payload,
-                        api_key=api_key,
-                        extra_headers=extra_headers or None,
-                        timeout=timeout,
-                    )
+                    data = send_request(url=f"{base_url}/chat/completions", payload=payload)
                     content = extract_openai_content(data)
                 else:
                     payload = {
@@ -377,13 +394,7 @@ def call_model(
                         "system_prompt": system_prompt,
                         "input": doc_input,
                     }
-                    data = post_request(
-                        url=f"{base_url}/chat",
-                        payload=payload,
-                        api_key=api_key,
-                        extra_headers=extra_headers or None,
-                        timeout=timeout,
-                    )
+                    data = send_request(url=f"{base_url}/chat", payload=payload)
                     content = extract_chat_content(data)
                 try:
                     return ensure_json_dict(content)

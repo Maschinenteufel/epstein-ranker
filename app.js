@@ -2,6 +2,7 @@ import { POWER_ALIASES } from "./power_aliases.js";
 
 const DEFAULT_CHUNK_SIZE = 1000;
 const DATASET_STORAGE_KEY = "epstein_viewer_dataset";
+const ALL_VOLUMES_VALUE = "__all__";
 const DATASETS = {
   oversight: {
     key: "oversight",
@@ -43,6 +44,8 @@ const POWER_ALIAS_MAP = {
 
 const elements = {
   datasetSelector: document.getElementById("datasetSelector"),
+  volumeFilterGroup: document.getElementById("volumeFilterGroup"),
+  volumeFilter: document.getElementById("volumeFilter"),
   datasetTitle: document.getElementById("datasetTitle"),
   datasetSubtitle: document.getElementById("datasetSubtitle"),
   processingLabel: document.getElementById("processingLabel"),
@@ -137,6 +140,7 @@ function updateDatasetCopy() {
   if (elements.datasetSelector) {
     elements.datasetSelector.value = dataset.key;
   }
+  updateVolumeFilterVisibility();
 }
 
 function resetDatasetState() {
@@ -198,6 +202,7 @@ function setFiltersEnabled(enabled, { triggerApply = false } = {}) {
   state.filtersEnabled = !!enabled;
   const controls = [
     elements.scoreFilter,
+    elements.volumeFilter,
     elements.leadFilter,
     elements.powerFilter,
     elements.searchInput,
@@ -251,6 +256,16 @@ function getGridColumnDefs() {
       cellClass: "score-cell",
       pinned: isMobile ? "left" : null,
       tooltipValueGetter: (params) => `Score: ${params.value ?? 0}`,
+    },
+    {
+      headerName: "Volume",
+      field: "volume_label",
+      width: 115,
+      minWidth: 95,
+      maxWidth: 135,
+      hide: isMobile || state.activeDatasetKey !== "doj_fta",
+      cellRenderer: (params) => `<span class="cell-text">${params.value || "—"}</span>`,
+      tooltipValueGetter: (params) => params.data?.volume_label || "—",
     },
     {
       headerName: "Headline",
@@ -572,6 +587,37 @@ function deriveJusticePdfUrl(filename) {
   return `https://www.justice.gov/epstein/files/DataSet%20${datasetNumber}/${eftaId}.pdf`;
 }
 
+function deriveVolumeLabel(row) {
+  const formatVolume = (num) => `VOL${String(num).padStart(5, "0")}`;
+  const readVolume = (value) => {
+    if (!value) return null;
+    const text = String(value);
+    const volMatch = text.match(/(?:^|[_/\\-])vol(?:ume)?[_-]?0*(\d{1,5})(?:$|[_/\\-])/i);
+    if (volMatch) {
+      const n = Number.parseInt(volMatch[1], 10);
+      if (Number.isFinite(n) && n > 0) {
+        return formatVolume(n);
+      }
+    }
+    const datasetMatch = text.match(/DataSet(?:%20|\s)*0*(\d{1,5})/i);
+    if (datasetMatch) {
+      const n = Number.parseInt(datasetMatch[1], 10);
+      if (Number.isFinite(n) && n > 0) {
+        return formatVolume(n);
+      }
+    }
+    return null;
+  };
+
+  return (
+    readVolume(row?.metadata?.config?.dataset_tag) ||
+    readVolume(row?.filename) ||
+    readVolume(row?.source_pdf_url) ||
+    readVolume(row?.metadata?.source_pdf_url) ||
+    ""
+  );
+}
+
 function normalizeRow(row) {
   const importance = Number(row.importance_score ?? 0);
   const arrays = (value) => (Array.isArray(value) ? value : []);
@@ -581,6 +627,7 @@ function normalizeRow(row) {
   const normalizedPowers = normalizePowerMentions(rawPowers);
   const normalized = {
     filename: row.filename,
+    volume_label: deriveVolumeLabel(row),
     source_row_index: row.metadata?.source_row_index ?? null,
     headline: row.headline || row.metadata?.original_row?.filename || "Untitled lead",
     importance_score: Number.isFinite(importance) ? importance : 0,
@@ -602,6 +649,7 @@ function normalizeRow(row) {
         : "",
   };
   normalized.search_blob = [
+    normalized.volume_label,
     normalized.headline,
     normalized.reason,
     normalized.key_insights.join(" "),
@@ -623,6 +671,7 @@ function populateFilters(data, preserveSelection = false) {
 
   const sortedLeads = sortValuesByCount(Array.from(leadCounts.keys()), leadCounts);
   const sortedPowers = sortValuesByCount(Array.from(powerCounts.keys()), powerCounts);
+  populateVolumeFilter(data, preserveSelection);
 
   setChoiceOptions(state.leadChoices, sortedLeads, prevLead, null, leadCounts, leadCounts);
   setChoiceOptions(
@@ -633,6 +682,49 @@ function populateFilters(data, preserveSelection = false) {
     powerCounts,
     powerCounts
   );
+}
+
+function sortVolumeLabels(values) {
+  return Array.from(values).sort((a, b) => {
+    const aNum = Number.parseInt(String(a).replace(/\D+/g, ""), 10);
+    const bNum = Number.parseInt(String(b).replace(/\D+/g, ""), 10);
+    if (Number.isFinite(aNum) && Number.isFinite(bNum) && aNum !== bNum) {
+      return aNum - bNum;
+    }
+    return String(a).localeCompare(String(b));
+  });
+}
+
+function populateVolumeFilter(data, preserveSelection = false) {
+  if (!elements.volumeFilter) return;
+  const previous = preserveSelection ? elements.volumeFilter.value : ALL_VOLUMES_VALUE;
+  const volumeLabels = sortVolumeLabels(
+    new Set(
+      data
+        .map((row) => row.volume_label)
+        .filter((value) => typeof value === "string" && value.trim().length > 0)
+    )
+  );
+  const options = [
+    `<option value="${ALL_VOLUMES_VALUE}">All volumes</option>`,
+    ...volumeLabels.map((value) => `<option value="${value}">${value}</option>`),
+  ];
+  elements.volumeFilter.innerHTML = options.join("");
+  const nextValue = volumeLabels.includes(previous) ? previous : ALL_VOLUMES_VALUE;
+  elements.volumeFilter.value = nextValue;
+}
+
+function updateVolumeFilterVisibility() {
+  const isDoj = state.activeDatasetKey === "doj_fta";
+  if (elements.volumeFilterGroup) {
+    elements.volumeFilterGroup.classList.toggle("hidden", !isDoj);
+  }
+  if (!isDoj && elements.volumeFilter) {
+    elements.volumeFilter.value = ALL_VOLUMES_VALUE;
+  }
+  if (state.gridOptions?.columnApi) {
+    state.gridOptions.columnApi.setColumnsVisible(["volume_label"], isDoj && !isMobileView());
+  }
 }
 
 function setChoiceOptions(
@@ -692,6 +784,7 @@ function applyFilters(options = {}) {
   const leadSelected = new Set(getSelectedValues(state.leadChoices));
   const powerSelectedRaw = getSelectedValues(state.powerChoices);
   const powerSelection = expandPowerSelection(powerSelectedRaw);
+  const selectedVolume = elements.volumeFilter?.value || ALL_VOLUMES_VALUE;
   const limit = Number(elements.limitInput.value) || null;
   const term = elements.searchInput.value.trim().toLowerCase();
 
@@ -703,6 +796,9 @@ function applyFilters(options = {}) {
     filtered = filtered.filter((row) =>
       row.power_mentions.some((name) => matchesPowerSelection(name, powerSelection))
     );
+  }
+  if (selectedVolume !== ALL_VOLUMES_VALUE) {
+    filtered = filtered.filter((row) => row.volume_label === selectedVolume);
   }
   if (term) {
     filtered = filtered.filter((row) => row.search_blob.includes(term));
@@ -1471,6 +1567,9 @@ function resolveChunkPath(path) {
 function resetFilters() {
   elements.scoreFilter.value = 0;
   elements.scoreValue.textContent = "0";
+  if (elements.volumeFilter) {
+    elements.volumeFilter.value = ALL_VOLUMES_VALUE;
+  }
   state.leadChoices?.removeActiveItems();
   state.powerChoices?.removeActiveItems();
   elements.searchInput.value = "";
@@ -1519,6 +1618,7 @@ function wireEvents() {
   });
   elements.leadFilter.addEventListener("change", applyFilters);
   elements.powerFilter.addEventListener("change", applyFilters);
+  elements.volumeFilter?.addEventListener("change", applyFilters);
   elements.resetFilters.addEventListener("click", resetFilters);
   elements.detailClose.addEventListener("click", () => clearDetail());
   elements.detailTextToggle.addEventListener("click", toggleDetailText);
