@@ -645,22 +645,42 @@ def count_total_rows(
     input_glob: str = "*.txt",
     processing_mode: str = "auto",
     pdf_part_pages: int = 0,
+    progress_label: Optional[str] = None,
 ) -> int:
     """Count total number of source rows for CSV or directory input."""
+    last_progress_at = time.monotonic()
+    scanned_rows = 0
+
+    def maybe_log_progress(force: bool = False) -> None:
+        nonlocal last_progress_at
+        if not progress_label:
+            return
+        now = time.monotonic()
+        if not force and now - last_progress_at < 10:
+            return
+        print(f"{progress_label}: scanned {scanned_rows:,} row(s)...", flush=True)
+        last_progress_at = now
+
     if path.is_dir():
-        return sum(
-            1
-            for _ in iter_rows(
+        for scanned_rows, _ in enumerate(
+            iter_rows(
                 path,
                 input_glob=input_glob,
                 include_text=False,
                 processing_mode=processing_mode,
                 pdf_part_pages=pdf_part_pages,
-            )
-        )
+            ),
+            start=1,
+        ):
+            maybe_log_progress()
+        maybe_log_progress(force=True)
+        return scanned_rows
     with path.open(newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
-        return sum(1 for _ in reader)
+        for scanned_rows, _ in enumerate(reader, start=1):
+            maybe_log_progress()
+        maybe_log_progress(force=True)
+        return scanned_rows
 
 
 def calculate_workload(
@@ -673,10 +693,14 @@ def calculate_workload(
     completed_filenames: Set[str],
     start_row: int,
     end_row: Optional[int],
+    progress_label: Optional[str] = None,
 ) -> Dict[str, int]:
     total = 0
     already_done = 0
     workload = 0
+    scanned_rows = 0
+    last_progress_at = time.monotonic()
+
     for idx, row in enumerate(
         iter_rows(
             path,
@@ -687,6 +711,16 @@ def calculate_workload(
         ),
         start=1,
     ):
+        scanned_rows = idx
+        if progress_label:
+            now = time.monotonic()
+            if now - last_progress_at >= 10:
+                print(
+                    f"{progress_label}: scanned {scanned_rows:,} row(s) | "
+                    f"in-range {total:,} | pending {workload:,} | already-done {already_done:,}",
+                    flush=True,
+                )
+                last_progress_at = now
         if idx < start_row:
             continue
         if end_row is not None and idx > end_row:
@@ -699,6 +733,12 @@ def calculate_workload(
             workload += 1
         if max_rows is not None and workload >= max_rows:
             break
+    if progress_label:
+        print(
+            f"{progress_label}: complete after scanning {scanned_rows:,} row(s) | "
+            f"in-range {total:,} | pending {workload:,} | already-done {already_done:,}",
+            flush=True,
+        )
     return {"total": total, "already_done": already_done, "workload": workload}
 
 
@@ -1796,6 +1836,13 @@ def main() -> None:
     if completed_source_ids:
         print(f"Skipping {len(completed_source_ids)} pre-processed source ids.")
 
+    workload_progress_label: Optional[str] = None
+    if active_processing_mode == "image" and args.input.is_dir():
+        workload_progress_label = (
+            "Planning workload (PDF split/page detection can take time on large volumes)"
+        )
+        print("Planning workload before request submission...", flush=True)
+
     workload_stats = calculate_workload(
         args.input,
         input_glob=args.input_glob,
@@ -1805,6 +1852,7 @@ def main() -> None:
         completed_filenames=completed_source_ids if args.resume else set(),
         start_row=args.start_row,
         end_row=args.end_row,
+        progress_label=workload_progress_label,
     )
     total_candidates = workload_stats["total"]
     already_done = workload_stats["already_done"] if args.resume else 0
@@ -1820,25 +1868,49 @@ def main() -> None:
 
     output_router = OutputRouter(args, fieldnames)
     total_dataset_rows: Optional[int] = None
+    can_reuse_workload_total = (
+        args.start_row == 1 and args.end_row is None and args.max_rows is None
+    )
 
     # Count total rows in dataset for manifest metadata
-    if output_router.mode == "chunk":
+    if output_router.mode == "chunk" and can_reuse_workload_total:
+        output_router.total_dataset_rows = total_candidates
+        total_dataset_rows = output_router.total_dataset_rows
+        print(
+            f"Total dataset: {output_router.total_dataset_rows:,} rows (reused from workload scan)",
+            flush=True,
+        )
+    elif output_router.mode == "chunk":
         print("Counting total rows in dataset...")
         output_router.total_dataset_rows = count_total_rows(
             args.input,
             input_glob=args.input_glob,
             processing_mode=active_processing_mode,
             pdf_part_pages=args.pdf_part_pages,
+            progress_label=(
+                "Counting total rows (cached page counts)"
+                if active_processing_mode == "image" and args.input.is_dir()
+                else None
+            ),
         )
         total_dataset_rows = output_router.total_dataset_rows
         print(f"Total dataset: {output_router.total_dataset_rows:,} rows")
+    elif can_reuse_workload_total and args.run_metadata_file:
+        total_dataset_rows = total_candidates
     elif args.run_metadata_file:
         # Single-file mode still records total row count in run metadata.
+        if active_processing_mode == "image" and args.input.is_dir():
+            print("Counting total rows in dataset for run metadata...", flush=True)
         total_dataset_rows = count_total_rows(
             args.input,
             input_glob=args.input_glob,
             processing_mode=active_processing_mode,
             pdf_part_pages=args.pdf_part_pages,
+            progress_label=(
+                "Counting total rows for metadata (cached page counts)"
+                if active_processing_mode == "image" and args.input.is_dir()
+                else None
+            ),
         )
 
     checkpoint_handle = (

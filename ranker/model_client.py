@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import functools
 import io
 import json
 import math
@@ -261,6 +262,7 @@ def render_pdf_page_to_data_url(pdf_path: Path, *, page_number: int, dpi: int) -
     )
 
 
+@functools.lru_cache(maxsize=8192)
 def detect_pdf_page_count(pdf_path: Path) -> Optional[int]:
     cmd = ["pdfinfo", str(pdf_path)]
     try:
