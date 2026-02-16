@@ -67,6 +67,7 @@ const elements = {
   detailTags: document.getElementById("detailTags"),
   detailModel: document.getElementById("detailModel"),
   detailSourceUrl: document.getElementById("detailSourceUrl"),
+  detailTextPanel: document.getElementById("detailTextPanel"),
   detailText: document.getElementById("detailText"),
   detailTextPreview: document.getElementById("detailTextPreview"),
   detailTextToggle: document.getElementById("detailTextToggle"),
@@ -593,7 +594,10 @@ function normalizeRow(row) {
       row.source_pdf_url ||
       row.metadata?.source_pdf_url ||
       deriveJusticePdfUrl(row.filename || row.metadata?.original_row?.filename || ""),
-    original_text: row.metadata?.original_row?.text || "",
+    original_text:
+      typeof row.metadata?.original_row?.text === "string"
+        ? row.metadata.original_row.text
+        : "",
   };
   normalized.search_blob = [
     normalized.headline,
@@ -1590,28 +1594,33 @@ function renderDetail(row, options = {}) {
   const model = row.metadata?.config?.model || "—";
   elements.detailModel.textContent = model;
   if (row.source_pdf_url) {
-    elements.detailSourceUrl.textContent = "Open source PDF";
+    elements.detailSourceUrl.textContent = "Open source file";
     elements.detailSourceUrl.href = row.source_pdf_url;
   } else {
     elements.detailSourceUrl.textContent = "—";
     elements.detailSourceUrl.removeAttribute("href");
   }
 
-  // Handle original text with collapse/expand
-  const originalText = row.original_text || "No source text captured.";
-  const wordCount = originalText.split(/\s+/).filter(Boolean).length;
-  const snippet = originalText.split(/\s+/).slice(0, 30).join(" ");
-
-  const highlightedText = highlightText(originalText, highlightTerms);
-  const highlightedSnippet = highlightText(snippet, highlightTerms);
-
-  elements.detailText.innerHTML = highlightedText;
-  elements.detailTextPreview.innerHTML = `${highlightedSnippet}... (${wordCount.toLocaleString()} words)`;
-
-  // Reset to collapsed state
-  elements.detailText.classList.add("hidden");
-  elements.detailTextPreview.classList.remove("hidden");
-  elements.detailTextToggle.textContent = "Expand";
+  // Hide the text panel entirely when no source text is available (image-first runs).
+  const originalText = (row.original_text || "").trim();
+  if (!originalText) {
+    if (elements.detailTextPanel) {
+      elements.detailTextPanel.classList.add("hidden");
+    }
+  } else {
+    if (elements.detailTextPanel) {
+      elements.detailTextPanel.classList.remove("hidden");
+    }
+    const wordCount = originalText.split(/\s+/).filter(Boolean).length;
+    const snippet = originalText.split(/\s+/).slice(0, 30).join(" ");
+    const highlightedText = highlightText(originalText, highlightTerms);
+    const highlightedSnippet = highlightText(snippet, highlightTerms);
+    elements.detailText.innerHTML = highlightedText;
+    elements.detailTextPreview.innerHTML = `${highlightedSnippet}... (${wordCount.toLocaleString()} words)`;
+    elements.detailText.classList.add("hidden");
+    elements.detailTextPreview.classList.remove("hidden");
+    elements.detailTextToggle.textContent = "Expand";
+  }
 
   elements.detailInsights.innerHTML =
     row.key_insights.length > 0
@@ -1638,6 +1647,9 @@ function clearDetail() {
   elements.detailModel.textContent = "—";
   elements.detailSourceUrl.textContent = "—";
   elements.detailSourceUrl.removeAttribute("href");
+  if (elements.detailTextPanel) {
+    elements.detailTextPanel.classList.remove("hidden");
+  }
   elements.detailText.innerHTML = "—";
   elements.detailTextPreview.innerHTML = "—";
   elements.detailText.classList.add("hidden");

@@ -14,12 +14,42 @@ from collections import deque
 from pathlib import Path
 from typing import Any, Deque, Dict, Iterable, List, Optional, Set, Tuple
 
-try:
-    import tomllib  # Python 3.11+
-except ModuleNotFoundError:  # pragma: no cover
-    import tomli as tomllib  # type: ignore
-
 import requests
+
+from ranker.cli import (
+    apply_config_defaults,
+    apply_dataset_workspace_defaults,
+    explicit_cli_destinations,
+    infer_dataset_tag,
+    load_system_prompt,
+    parse_args,
+    sanitize_dataset_tag,
+)
+from ranker.constants import (
+    AGENCY_CANONICAL_MAP,
+    DEFAULT_JUSTICE_FILES_BASE_URL,
+    IMAGE_SUFFIXES,
+    LEAD_TYPE_CANONICAL_MAP,
+    RETRIABLE_HTTP_STATUS_CODES,
+    TEXT_SUFFIXES,
+)
+from ranker.model_client import (
+    ModelRequestError,
+    UnsupportedEndpointError,
+    build_image_analysis_instruction,
+    build_request_targets,
+    build_text_analysis_input,
+    derive_localhost_fallback_endpoints,
+    ensure_json_dict,
+    extract_chat_content,
+    extract_openai_content,
+    image_path_to_data_url,
+    infer_api_priority,
+    post_request,
+    prepare_image_data_urls,
+    render_pdf_page_to_data_url,
+)
+from ranker import model_client as _model_client
 
 
 try:
@@ -28,811 +58,55 @@ except OverflowError:
     csv.field_size_limit(2**31 - 1)
 
 
-DEFAULT_SYSTEM_PROMPT = (
-    "You analyze primary documents related to court and investigative filings.\n"
-    "Focus on whether the passage offers potential leads—even if unverified—that\n"
-    "connect influential actors (presidents, cabinet officials, foreign leaders,\n"
-    "billionaires, intelligence agencies) to controversial actions, financial flows, or\n"
-    "possible misconduct.\n"
-    "Score each passage on:\n"
-    "  1. Investigative usefulness: Does it suggest concrete follow-up steps, names,\n"
-    "     transactions, dates, or relationships worth pursuing?\n"
-    "  2. Controversy / sensitivity: Would the lead cause public outcry or legal risk if\n"
-    "     validated?\n"
-    "  3. Novelty: Is this information new or rarely reported, versus already known?\n"
-    "  4. Power linkage: Does it implicate high-ranking officials or major power\n"
-    "     centers? Leads tying unknown individuals only to minor issues should score\n"
-    "     lower.\n"
-    "Assign an importance_score from 0 (no meaningful lead) to 100 (blockbuster lead\n"
-"linking powerful actors to fresh controversy). Use the full range—avoid clustering\n"
-"around a few favorite numbers so similar passages can still be differentiated.\n"
-"Use the scale consistently:\n"
-"  • 0–10  : noise, duplicates, previously published facts, or gossip with no actors.\n"
-"  • 10–30 : low-value context; speculative or weak leads lacking specifics.\n"
-"  • 30–50 : moderate leads with partial details or missing novelty.\n"
-"  • 50–70 : strong leads with actionable info or notable controversy.\n"
-"  • 70–85 : high-impact, new revelations tying powerful actors to clear misconduct.\n"
-"  • 85–100: blockbuster revelations demanding immediate follow-up.\n"
-"Reserve 70+ for claims that, if true, would represent major revelations or\n"
-"next-step investigations.\n"
-    "Return strict JSON with the following fields:\n"
-    "  - headline (string)\n"
-    "  - importance_score (0-100 number)\n"
-    "  - reason (string explaining score)\n"
-    "  - key_insights (array of short bullet strings)\n"
-    "  - tags (array of topical strings)\n"
-    "  - power_mentions (array listing high-profile people or institutions mentioned;\n"
-    "    include titles or roles if possible)\n"
-    "  - agency_involvement (array naming government, intelligence, or law-enforcement\n"
-    "    bodies involved or implicated)\n"
-    "  - lead_types (array describing lead categories such as 'financial flow',\n"
-    "    'legal exposure', 'foreign influence', 'sexual misconduct', etc.)\n"
-    "If a category has no data, return an empty array for it."
-)
+def call_model(**kwargs: Any) -> Dict[str, Any]:
+    """Compatibility wrapper to keep monkeypatching gpt_ranker.post_request working in tests."""
+    original_post_request = _model_client.post_request
+    try:
+        _model_client.post_request = post_request
+        return _model_client.call_model(**kwargs)
+    finally:
+        _model_client.post_request = original_post_request
 
-LEAD_TYPE_CANONICAL_MAP = {
-    "financial flow": {
-        "financial flow",
-        "financial flows",
-        "financial transaction",
-        "money trail",
-        "money movement",
-        "money laundering",
-        "overpriced sale",
-        "payment chain",
-    },
-    "foreign influence": {
-        "foreign influence",
-        "foreign interference",
-        "foreign collusion",
-    },
-    "legal exposure": {"legal exposure", "legal risk", "criminal liability"},
-    "political corruption": {"political corruption", "corruption", "quid pro quo"},
-    "sexual misconduct": {"sexual misconduct", "sexual abuse", "sex trafficking"},
-    "intelligence operation": {
-        "intelligence operation",
-        "intelligence activity",
-        "spycraft",
-        "espionage",
-    },
-    "national security": {"national security", "security breach"},
-    "human trafficking": {
-        "human trafficking",
-        "trafficking",
-        "exploitation",
-    },
-    "cover-up": {"cover-up", "cover up", "obstruction"},
-    "financial fraud": {"financial fraud", "fraud"},
-}
-
-AGENCY_CANONICAL_MAP = {
-    "NSA": {"nsa", "national security agency"},
-    "CIA": {"cia", "central intelligence agency"},
-    "FBI": {"fbi", "federal bureau of investigation"},
-    "DOJ": {"doj", "department of justice", "u.s. department of justice"},
-    "DHS": {"dhs", "department of homeland security"},
-    "ODNI": {"odni", "office of the director of national intelligence"},
-    "State Department": {"state department", "u.s. department of state", "dos"},
-    "Treasury": {"treasury", "u.s. treasury", "department of the treasury"},
-    "IRS": {"irs", "internal revenue service"},
-    "SEC": {"sec", "securities and exchange commission"},
-    "House Oversight Committee": {
-        "house oversight committee",
-        "house oversight",
-        "house committee on oversight",
-    },
-    "Senate Judiciary Committee": {"senate judiciary committee", "senate judiciary"},
-    "Congress": {"congress", "u.s. congress"},
-    "FSB": {"fsb", "federal security service"},
-    "GRU": {"gru", "main directorate"},
-    "GCHQ": {"gchq", "government communications headquarters"},
-    "MI6": {"mi6", "secret intelligence service", "sis"},
-    "MI5": {"mi5"},
-    "Mossad": {"mossad"},
-    "Interpol": {"interpol"},
-    "NYPD": {"nypd", "new york police department"},
-}
-
-DEFAULT_JUSTICE_FILES_BASE_URL = "https://www.justice.gov/epstein/files"
-
-RETRIABLE_HTTP_STATUS_CODES = {408, 409, 425, 429}
-
-
-class UnsupportedEndpointError(RuntimeError):
-    """Raised when a specific API route is unavailable on the target server."""
-
-
-class ModelRequestError(RuntimeError):
-    """Raised for model request failures with retriable vs permanent classification."""
-
-    def __init__(self, message: str, *, retriable: bool) -> None:
-        super().__init__(message)
-        self.retriable = retriable
-
-
-def explicit_cli_destinations(argv: List[str]) -> Set[str]:
-    explicit: Set[str] = set()
-    for token in argv:
-        if token == "--":
-            break
-        if not token.startswith("--"):
-            continue
-        flag = token[2:]
-        if "=" in flag:
-            flag = flag.split("=", 1)[0]
-        if flag.startswith("no-"):
-            flag = flag[3:]
-        explicit.add(flag.replace("-", "_"))
-    return explicit
-
-
-def sanitize_dataset_tag(value: str) -> str:
-    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip())
-    cleaned = cleaned.strip("._-")
-    return cleaned or "dataset"
-
-
-def infer_dataset_tag(input_path: Path) -> str:
-    if input_path.name:
-        stem = input_path.stem if input_path.is_file() else input_path.name
-        if stem:
-            return sanitize_dataset_tag(stem)
-    return "dataset"
-
-
-def apply_dataset_workspace_defaults(
-    args: argparse.Namespace,
-    *,
-    cli_explicit: Optional[Set[str]] = None,
-) -> None:
-    explicit = cli_explicit or set()
-    if not args.dataset_workspace_root:
-        return
-
-    workspace_root = Path(args.dataset_workspace_root)
-    tag = args.dataset_tag or infer_dataset_tag(args.input)
-    tag = sanitize_dataset_tag(tag)
-    args.dataset_tag = tag
-    base = workspace_root / tag
-
-    workspace_defaults = {
-        "output": base / "results" / "epstein_ranked.csv",
-        "json_output": base / "results" / "epstein_ranked.jsonl",
-        "checkpoint": base / "state" / ".epstein_checkpoint",
-        "chunk_dir": base / "chunks",
-        "chunk_manifest": base / "metadata" / "chunks.json",
-        "run_metadata_file": base / "metadata" / "run_metadata.json",
-    }
-    for key, value in workspace_defaults.items():
-        if key not in explicit:
-            setattr(args, key, value)
-
-    # Prevent accidental overlap with other corpora when using isolated workspaces.
-    if "known_json" not in explicit:
-        args.known_json = []
-
-
-def apply_config_defaults(
-    parser: argparse.ArgumentParser,
-    args: argparse.Namespace,
-    cli_explicit: Optional[Set[str]] = None,
-) -> None:
-    explicit = cli_explicit or set()
-    config_path: Path = args.config  # type: ignore[assignment]
-    if not config_path.exists():
-        raise FileNotFoundError(f"Config file not found: {config_path}")
-    with config_path.open("rb") as handle:
-        data = tomllib.load(handle)
-    for key, value in data.items():
-        if not hasattr(args, key):
-            continue
-        if key in explicit:
-            continue
-        current = getattr(args, key)
-        default = parser.get_default(key)
-        if current == default:
-            if isinstance(default, Path):
-                setattr(args, key, Path(value))
-            else:
-                setattr(args, key, value)
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Call a local model gateway (OpenAI-style or /chat style) to extract "
-            "useful information and rank each source row."
-        )
-    )
-    parser.add_argument(
-        "--config",
-        type=Path,
-        help="Optional TOML config file to supply defaults (see ranker_config.example.toml).",
-    )
-    parser.add_argument(
-        "--input",
-        type=Path,
-        default=Path("data") / "EPS_FILES_20K_NOV2026.csv",
-        help="Path to the source CSV (filename/text columns) or a directory of .txt files.",
-    )
-    parser.add_argument(
-        "--input-glob",
-        default="*.txt",
-        help="Glob used when --input points to a directory (searched recursively).",
-    )
-    parser.add_argument(
-        "--dataset-workspace-root",
-        type=Path,
-        default=None,
-        help=(
-            "If set, isolate outputs/checkpoint/chunks under "
-            "<dataset-workspace-root>/<dataset-tag>/ to avoid mixing corpora."
-        ),
-    )
-    parser.add_argument(
-        "--dataset-tag",
-        default=None,
-        help="Dataset identifier used with --dataset-workspace-root (defaults to input name).",
-    )
-    parser.add_argument(
-        "--dataset-source-label",
-        default=None,
-        help="Optional human-readable source label for provenance metadata.",
-    )
-    parser.add_argument(
-        "--dataset-source-url",
-        default=None,
-        help="Optional source URL for provenance metadata.",
-    )
-    parser.add_argument(
-        "--dataset-metadata-file",
-        type=Path,
-        default=None,
-        help="Optional JSON file containing dataset provenance/stats to attach to run metadata.",
-    )
-    parser.add_argument(
-        "--run-metadata-file",
-        type=Path,
-        default=None,
-        help="Optional JSON sidecar path for run metadata (auto-set in workspace mode).",
-    )
-    parser.add_argument(
-        "--output",
-        type=Path,
-        default=Path("data") / "epstein_ranked.csv",
-        help="Path to write the ranked CSV results.",
-    )
-    parser.add_argument(
-        "--json-output",
-        type=Path,
-        default=Path("data") / "epstein_ranked.jsonl",
-        help="Path to append newline-delimited JSON records for each row.",
-    )
-    parser.add_argument(
-        "--endpoint",
-        default="http://localhost:5555/api/v1",
-        help="Base URL of the local model gateway.",
-    )
-    parser.add_argument(
-        "--api-format",
-        choices=["auto", "openai", "chat"],
-        default="auto",
-        help=(
-            "Request format to use: openai (/chat/completions), chat (/chat), "
-            "or auto-detect/fallback."
-        ),
-    )
-    parser.add_argument(
-        "--model",
-        default="qwen/qwen3-coder-next",
-        help="Model identifier exposed by the server (check via --list-models).",
-    )
-    parser.add_argument(
-        "--justice-files-base-url",
-        default=DEFAULT_JUSTICE_FILES_BASE_URL,
-        help="Base URL for DOJ Epstein PDF files used to derive source document links.",
-    )
-    parser.add_argument(
-        "--max-parallel-requests",
-        type=int,
-        default=4,
-        help="Maximum concurrent model requests.",
-    )
-    parser.add_argument(
-        "--temperature",
-        type=float,
-        default=0.0,
-        help="Temperature for model responses (0.0 = deterministic, higher = more random).",
-    )
-    parser.add_argument(
-        "--prompt-file",
-        type=Path,
-        default=None,
-        help="Path to a text file containing the system prompt (overrides default).",
-    )
-    parser.add_argument(
-        "--system-prompt",
-        default=None,
-        help="Inline system prompt string (overrides --prompt-file and default).",
-    )
-    parser.add_argument(
-        "--api-key",
-        default=None,
-        help="Optional API key for servers that require authentication.",
-    )
-    parser.add_argument(
-        "--reasoning-effort",
-        choices=["low", "medium", "high"],
-        help="If provided, passes reasoning effort hints supported by some models.",
-    )
-    parser.add_argument(
-        "--resume",
-        action="store_true",
-        help="Skip rows already present in the checkpoint or JSON output.",
-    )
-    parser.add_argument(
-        "--overwrite-output",
-        action="store_true",
-        help="Allow truncating existing output/JSONL files (use with caution).",
-    )
-    parser.add_argument(
-        "--checkpoint",
-        type=Path,
-        default=Path("data") / ".epstein_checkpoint",
-        help="Plain-text file storing processed filenames (used with --resume).",
-    )
-    parser.add_argument(
-        "--known-json",
-        action="append",
-        default=[],
-        help="Additional JSONL files containing already-processed rows to skip.",
-    )
-    parser.add_argument(
-        "--chunk-size",
-        type=int,
-        default=1000,
-        help="If >0, rotate outputs every N source rows and store chunk files in --chunk-dir.",
-    )
-    parser.add_argument(
-        "--chunk-dir",
-        type=Path,
-        default=Path("contrib"),
-        help="Directory to store chunked outputs when --chunk-size > 0.",
-    )
-    parser.add_argument(
-        "--chunk-manifest",
-        type=Path,
-        default=Path("data") / "chunks.json",
-        help="Manifest JSON file listing generated chunks (used by the viewer).",
-    )
-    parser.add_argument(
-        "--include-action-items",
-        action="store_true",
-        help="Request action items from the model and include them in outputs.",
-    )
-    parser.add_argument(
-        "--start-row",
-        type=int,
-        default=1,
-        help="1-based row index to start processing (useful for collaborative chunking).",
-    )
-    parser.add_argument(
-        "--end-row",
-        type=int,
-        default=None,
-        help="1-based row index to stop processing (inclusive).",
-    )
-    parser.add_argument(
-        "--max-rows",
-        type=int,
-        default=None,
-        help="Limit processing to the first N rows (useful for smoke-tests).",
-    )
-    parser.add_argument(
-        "--sleep",
-        type=float,
-        default=0.0,
-        help="Seconds to sleep between requests to avoid overwhelming the server.",
-    )
-    parser.add_argument(
-        "--timeout",
-        type=float,
-        default=600.0,
-        help="HTTP request timeout in seconds (default: 600 = 10 minutes).",
-    )
-    parser.add_argument(
-        "--max-retries",
-        type=int,
-        default=3,
-        help="Maximum request attempts for transient endpoint/model failures.",
-    )
-    parser.add_argument(
-        "--retry-backoff",
-        type=float,
-        default=1.5,
-        help="Base seconds for exponential retry backoff (attempt_n = backoff * 2^(n-1)).",
-    )
-    parser.add_argument(
-        "--skip-low-quality",
-        dest="skip_low_quality",
-        action="store_true",
-        default=True,
-        help="Skip low-signal rows (empty/too-short/noisy) before model calls.",
-    )
-    parser.add_argument(
-        "--no-skip-low-quality",
-        dest="skip_low_quality",
-        action="store_false",
-        help="Disable low-quality row skipping.",
-    )
-    parser.add_argument(
-        "--min-text-chars",
-        type=int,
-        default=60,
-        help="Minimum non-whitespace character count required to process a row.",
-    )
-    parser.add_argument(
-        "--min-text-words",
-        type=int,
-        default=12,
-        help="Minimum token count required to process a row.",
-    )
-    parser.add_argument(
-        "--min-alpha-ratio",
-        type=float,
-        default=0.25,
-        help="Minimum alphabetic-character ratio required to process a row.",
-    )
-    parser.add_argument(
-        "--min-unique-word-ratio",
-        type=float,
-        default=0.15,
-        help="Minimum unique-word ratio required to process a row.",
-    )
-    parser.add_argument(
-        "--max-repeated-char-run",
-        type=int,
-        default=40,
-        help="Maximum repeated-character run before a row is considered noisy.",
-    )
-    parser.add_argument(
-        "--list-models",
-        action="store_true",
-        help="List models exposed by the endpoint and exit.",
-    )
-    parser.add_argument(
-        "--rebuild-manifest",
-        action="store_true",
-        help="Scan chunk files and rebuild the manifest (data/chunks.json), then exit.",
-    )
-    parser.add_argument(
-        "--power-watts",
-        type=float,
-        default=None,
-        help="If provided, estimate energy usage (average watts).",
-    )
-    parser.add_argument(
-        "--electric-rate",
-        type=float,
-        default=None,
-        help="Electricity cost in USD per kWh for cost estimation.",
-    )
-    parser.add_argument(
-        "--run-hours",
-        type=float,
-        default=None,
-        help="Override elapsed hours for cost estimate (otherwise uses wall time).",
-    )
-    args = parser.parse_args()
-    cli_explicit = explicit_cli_destinations(sys.argv[1:])
-    config_path = None
-    if args.config:
-        config_path = Path(args.config)
-    else:
-        for candidate in (Path("ranker_config.toml"), Path("ranker_config.example.toml")):
-            if candidate.exists():
-                config_path = candidate
-                break
-    if config_path:
-        args.config = config_path
-        apply_config_defaults(parser, args, cli_explicit=cli_explicit)
-    apply_dataset_workspace_defaults(args, cli_explicit=cli_explicit)
-    return args
-
-
-def load_system_prompt(args: argparse.Namespace) -> Tuple[str, str]:
-    """Load the system prompt from file or use inline/default prompt.
-
-    Returns:
-        Tuple of (prompt_text, prompt_source_description)
-    """
-    # Priority: inline --system-prompt > --prompt-file > default file > hardcoded default
-    if args.system_prompt:
-        return args.system_prompt, "inline (--system-prompt)"
-
-    prompt_file = args.prompt_file
-    if not prompt_file:
-        # Try default prompt file location
-        default_prompt_file = Path("prompts") / "default_system_prompt.txt"
-        if default_prompt_file.exists():
-            prompt_file = default_prompt_file
-        else:
-            # Fall back to hardcoded default
-            return DEFAULT_SYSTEM_PROMPT, "default (hardcoded)"
-
-    if not prompt_file.exists():
-        raise FileNotFoundError(f"Prompt file not found: {prompt_file}")
-
-    with prompt_file.open("r", encoding="utf-8") as f:
-        prompt = f.read().strip()
-
-    if not prompt:
-        raise ValueError(f"Prompt file is empty: {prompt_file}")
-
-    return prompt, str(prompt_file)
-
-
-def build_analysis_input(filename: str, text: str) -> str:
-    return (
-        "Analyze the following document and respond with the JSON schema "
-        "described in the system prompt.\n"
-        f"Filename: {filename}\n"
-        "---------\n"
-        f"{text.strip()}\n"
-        "---------"
-    )
-
-
-def infer_api_priority(endpoint: str) -> List[str]:
-    normalized = endpoint.rstrip("/")
-    if normalized.endswith("/api/v1"):
-        return ["chat", "openai"]
-    return ["openai", "chat"]
-
-
-def derive_localhost_fallback_endpoint(endpoint: str) -> Optional[str]:
-    normalized = endpoint.rstrip("/")
-    if re.match(r"^https?://(?:localhost|127\.0\.0\.1):5555/api/v1$", normalized):
-        return None
-    if re.match(r"^https?://(?:localhost|127\.0\.0\.1)(?::\d+)?(?:/.*)?$", normalized):
-        scheme = "https" if normalized.startswith("https://") else "http"
-        host = "127.0.0.1" if "127.0.0.1" in normalized else "localhost"
-        return f"{scheme}://{host}:5555/api/v1"
+def infer_row_input_kind(file_path: Path, processing_mode: str) -> Optional[str]:
+    suffix = file_path.suffix.lower()
+    if processing_mode == "text":
+        return "text" if suffix in TEXT_SUFFIXES else None
+    if processing_mode == "image":
+        return "image" if suffix in IMAGE_SUFFIXES else None
+    if suffix in TEXT_SUFFIXES:
+        return "text"
+    if suffix in IMAGE_SUFFIXES:
+        return "image"
     return None
 
 
-def build_request_targets(endpoint: str, api_format: str) -> List[Tuple[str, str]]:
-    normalized = endpoint.rstrip("/")
-    targets: List[Tuple[str, str]] = []
-
-    if api_format == "openai":
-        targets.append(("openai", normalized))
-    elif api_format == "chat":
-        targets.append(("chat", normalized))
-    else:
-        for mode in infer_api_priority(normalized):
-            targets.append((mode, normalized))
-        fallback_endpoint = derive_localhost_fallback_endpoint(normalized)
-        if fallback_endpoint:
-            for mode in infer_api_priority(fallback_endpoint):
-                targets.append((mode, fallback_endpoint))
-
-    deduped: List[Tuple[str, str]] = []
-    seen: Set[Tuple[str, str]] = set()
-    for mode, base in targets:
-        key = (mode, base)
-        if key in seen:
-            continue
-        deduped.append(key)
-        seen.add(key)
-    return deduped
-
-
-def post_request(
+def iter_rows(
+    path: Path,
     *,
-    url: str,
-    payload: Dict[str, Any],
-    api_key: Optional[str],
-    timeout: float,
-) -> Dict[str, Any]:
-    headers = {}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-
-    try:
-        response = requests.post(url, json=payload, timeout=timeout, headers=headers)
-    except (requests.ConnectionError, requests.Timeout) as exc:
-        raise ModelRequestError(f"Request failed for {url}: {exc}", retriable=True) from exc
-    except requests.RequestException as exc:
-        raise ModelRequestError(f"Request failed for {url}: {exc}", retriable=False) from exc
-
-    if response.status_code in (404, 405):
-        raise UnsupportedEndpointError(
-            f"HTTP {response.status_code} from {url}: endpoint not supported by this server"
-        )
-    if response.status_code >= 400:
-        snippet = response.text[:500].replace("\n", " ")
-        retriable = (
-            response.status_code in RETRIABLE_HTTP_STATUS_CODES
-            or 500 <= response.status_code < 600
-        )
-        raise ModelRequestError(
-            f"HTTP {response.status_code} from {url}: {snippet}",
-            retriable=retriable,
-        )
-
-    try:
-        return response.json()
-    except json.JSONDecodeError as exc:
-        snippet = response.text[:500].replace("\n", " ")
-        raise ModelRequestError(
-            f"Invalid JSON response from {url}: {snippet}",
-            retriable=False,
-        ) from exc
-
-
-def extract_openai_content(data: Dict[str, Any]) -> str:
-    try:
-        content = data["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError) as exc:
-        raise ModelRequestError(
-            f"Unexpected OpenAI response format: {data}",
-            retriable=False,
-        ) from exc
-    if not isinstance(content, str):
-        raise ModelRequestError(
-            f"Unexpected OpenAI response content type: {type(content)}",
-            retriable=False,
-        )
-    return content
-
-
-def extract_chat_content(data: Dict[str, Any]) -> str:
-    output = data.get("output")
-    if isinstance(output, list):
-        collected: List[str] = []
-        for item in output:
-            if isinstance(item, str):
-                collected.append(item)
-                continue
-            if isinstance(item, dict):
-                value = item.get("content")
-                if isinstance(value, str):
-                    collected.append(value)
-                    continue
-                value = item.get("text")
-                if isinstance(value, str):
-                    collected.append(value)
-        if collected:
-            return "\n".join(collected)
-
-    for key in ("content", "response", "text"):
-        value = data.get(key)
-        if isinstance(value, str) and value.strip():
-            return value
-    raise ModelRequestError(
-        f"Unexpected chat response format: {data}",
-        retriable=False,
-    )
-
-
-def call_model(
-    *,
-    endpoint: str,
-    api_format: str,
-    model: str,
-    filename: str,
-    text: str,
-    system_prompt: str,
-    api_key: Optional[str],
-    timeout: float,
-    max_retries: int,
-    retry_backoff: float,
-    temperature: float,
-    reasoning_effort: Optional[str],
-    config_metadata: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """Send a document to the model endpoint and return parsed JSON output."""
-    doc_input = build_analysis_input(filename, text)
-    targets = build_request_targets(endpoint, api_format)
-
-    last_error: Optional[Exception] = None
-    for attempt in range(1, max_retries + 1):
-        saw_retriable_error = False
-        for mode, base_url in targets:
-            try:
-                if mode == "openai":
-                    payload: Dict[str, Any] = {
-                        "model": model,
-                        "temperature": temperature,
-                        "messages": [
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": doc_input},
-                        ],
-                    }
-                    if reasoning_effort:
-                        payload["reasoning"] = {"effort": reasoning_effort}
-                    if config_metadata:
-                        payload["metadata"] = config_metadata
-                    data = post_request(
-                        url=f"{base_url}/chat/completions",
-                        payload=payload,
-                        api_key=api_key,
-                        timeout=timeout,
-                    )
-                    content = extract_openai_content(data)
-                else:
-                    payload = {
-                        "model": model,
-                        "system_prompt": system_prompt,
-                        "input": doc_input,
-                    }
-                    data = post_request(
-                        url=f"{base_url}/chat",
-                        payload=payload,
-                        api_key=api_key,
-                        timeout=timeout,
-                    )
-                    content = extract_chat_content(data)
-                return ensure_json_dict(content)
-            except UnsupportedEndpointError as exc:
-                last_error = exc
-                continue
-            except ModelRequestError as exc:
-                last_error = exc
-                saw_retriable_error = saw_retriable_error or exc.retriable
-                continue
-
-        if attempt < max_retries and saw_retriable_error:
-            sleep_seconds = retry_backoff * (2 ** (attempt - 1))
-            time.sleep(max(0.0, sleep_seconds))
-            continue
-        break
-
-    candidate_urls = ", ".join(
-        f"{base}/{'chat/completions' if mode == 'openai' else 'chat'}"
-        for mode, base in targets
-    )
-    detail = str(last_error) if last_error else "unknown error"
-    raise RuntimeError(
-        f"Failed to analyze after {max_retries} attempt(s). Tried: {candidate_urls}. Last error: {detail}"
-    )
-
-
-def ensure_json_dict(content: str) -> Dict[str, Any]:
-    """Parse the model response into a dictionary, trimming extra text if needed."""
-    candidate = content.strip()
-    if not candidate:
-        raise ValueError("Model returned an empty message.")
-
-    # Try direct JSON parse first.
-    try:
-        parsed = json.loads(candidate)
-    except json.JSONDecodeError:
-        start = candidate.find("{")
-        end = candidate.rfind("}")
-        if start == -1 or end == -1 or start >= end:
-            raise
-        parsed = json.loads(candidate[start : end + 1])
-
-    if not isinstance(parsed, dict):
-        raise TypeError(f"Expected a JSON object, received: {type(parsed)}")
-    return parsed
-
-
-def iter_rows(path: Path, *, input_glob: str = "*.txt", include_text: bool = True) -> Iterable[Dict[str, str]]:
+    input_glob: str = "*.txt",
+    include_text: bool = True,
+    processing_mode: str = "auto",
+) -> Iterable[Dict[str, Any]]:
     if path.is_dir():
         for file_path in sorted(path.rglob(input_glob)):
             if not file_path.is_file():
                 continue
-            row: Dict[str, str] = {
+            input_kind = infer_row_input_kind(file_path, processing_mode)
+            if not input_kind:
+                continue
+            row: Dict[str, Any] = {
                 "filename": file_path.relative_to(path).as_posix(),
                 "text": "",
+                "input_kind": input_kind,
+                "source_path": str(file_path),
             }
-            if include_text:
+            if include_text and input_kind == "text":
                 row["text"] = file_path.read_text(encoding="utf-8", errors="replace")
             yield row
         return
+
+    if processing_mode == "image":
+        raise ValueError("Image processing mode requires --input to be a directory, not CSV.")
 
     with path.open(newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
@@ -840,9 +114,19 @@ def iter_rows(path: Path, *, input_glob: str = "*.txt", include_text: bool = Tru
             if "text" not in row or "filename" not in row:
                 raise ValueError("Input CSV must contain 'filename' and 'text' columns.")
             if include_text:
-                yield row
+                yield {
+                    "filename": row["filename"],
+                    "text": row["text"],
+                    "input_kind": "text",
+                    "source_path": None,
+                }
             else:
-                yield {"filename": row["filename"], "text": ""}
+                yield {
+                    "filename": row["filename"],
+                    "text": "",
+                    "input_kind": "text",
+                    "source_path": None,
+                }
 
 
 def load_checkpoint(path: Optional[Path]) -> Set[str]:
@@ -974,16 +258,26 @@ def assess_text_quality(text: str) -> Dict[str, Any]:
     char_count = len(compact)
     tokens = re.findall(r"[A-Za-z0-9]+(?:'[A-Za-z0-9]+)?", compact)
     word_count = len(tokens)
+    token_lengths = [len(token) for token in tokens]
     alpha_count = sum(1 for ch in compact if ch.isalpha())
     unique_word_count = len({token.lower() for token in tokens})
+    short_token_count = sum(1 for length in token_lengths if length <= 2)
+    long_word_count = sum(1 for length in token_lengths if length >= 4)
+    avg_word_length = (
+        sum(token_lengths) / word_count if word_count else 0.0
+    )
     alpha_ratio = (alpha_count / char_count) if char_count else 0.0
     unique_word_ratio = (unique_word_count / word_count) if word_count else 0.0
+    short_token_ratio = (short_token_count / word_count) if word_count else 0.0
     repeated_run = max_repeated_char_run(compact)
     return {
         "char_count": char_count,
         "word_count": word_count,
+        "avg_word_length": round(avg_word_length, 4),
         "alpha_ratio": round(alpha_ratio, 4),
         "unique_word_ratio": round(unique_word_ratio, 4),
+        "short_token_ratio": round(short_token_ratio, 4),
+        "long_word_count": long_word_count,
         "max_repeated_char_run": repeated_run,
     }
 
@@ -1007,6 +301,21 @@ def build_skip_reason(quality: Dict[str, Any], args: argparse.Namespace) -> Opti
         return (
             "high repetition/noise "
             f"({quality['unique_word_ratio']:.2f} unique ratio < minimum {args.min_unique_word_ratio:.2f})"
+        )
+    if quality["word_count"] > 0 and quality["short_token_ratio"] > args.max_short_token_ratio:
+        return (
+            "too many short/noisy tokens "
+            f"({quality['short_token_ratio']:.2f} > max {args.max_short_token_ratio:.2f})"
+        )
+    if quality["word_count"] > 0 and quality["avg_word_length"] < args.min_avg_word_length:
+        return (
+            "average token length too low/noisy OCR "
+            f"({quality['avg_word_length']:.2f} < minimum {args.min_avg_word_length:.2f})"
+        )
+    if quality["word_count"] >= args.min_text_words and quality["long_word_count"] < args.min_long_word_count:
+        return (
+            "too few substantive words "
+            f"({quality['long_word_count']} words >=4 chars < minimum {args.min_long_word_count})"
         )
     if quality["max_repeated_char_run"] > args.max_repeated_char_run:
         return (
@@ -1047,10 +356,49 @@ def derive_justice_pdf_url(filename: str, base_url: str = DEFAULT_JUSTICE_FILES_
     return f"{base}/DataSet%20{dataset_num}/{efta_id}.pdf"
 
 
-def count_total_rows(path: Path, *, input_glob: str = "*.txt") -> int:
+def derive_local_source_url(
+    source_path: Optional[str],
+    source_filename: Optional[str],
+    *,
+    source_files_base_url: Optional[str],
+) -> Optional[str]:
+    if not source_path and not source_filename:
+        return None
+    path_obj = Path(source_path) if source_path else None
+    normalized = path_obj.as_posix() if path_obj else ""
+    if source_files_base_url:
+        base = source_files_base_url.rstrip("/")
+        if source_filename:
+            return f"{base}/{source_filename.lstrip('/')}"
+        if path_obj is not None:
+            return f"{base}/{path_obj.name}" if path_obj.is_absolute() else f"{base}/{normalized.lstrip('/')}"
+    if path_obj is None:
+        return None
+    parts = path_obj.parts
+    if "data" in parts:
+        data_index = parts.index("data")
+        web_path = Path(*parts[data_index:]).as_posix()
+        return f"/{web_path}"
+    return None
+
+
+def count_total_rows(
+    path: Path,
+    *,
+    input_glob: str = "*.txt",
+    processing_mode: str = "auto",
+) -> int:
     """Count total number of source rows for CSV or directory input."""
     if path.is_dir():
-        return sum(1 for _ in iter_rows(path, input_glob=input_glob, include_text=False))
+        return sum(
+            1
+            for _ in iter_rows(
+                path,
+                input_glob=input_glob,
+                include_text=False,
+                processing_mode=processing_mode,
+            )
+        )
     with path.open(newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
         return sum(1 for _ in reader)
@@ -1060,6 +408,7 @@ def calculate_workload(
     path: Path,
     *,
     input_glob: str,
+    processing_mode: str,
     max_rows: Optional[int],
     completed_filenames: Set[str],
     start_row: int,
@@ -1067,7 +416,15 @@ def calculate_workload(
 ) -> Dict[str, int]:
     total = 0
     already_done = 0
-    for idx, row in enumerate(iter_rows(path, input_glob=input_glob, include_text=False), start=1):
+    for idx, row in enumerate(
+        iter_rows(
+            path,
+            input_glob=input_glob,
+            include_text=False,
+            processing_mode=processing_mode,
+        ),
+        start=1,
+    ):
         if idx < start_row:
             continue
         if end_row is not None and idx > end_row:
@@ -1284,12 +641,16 @@ def build_config_metadata(args: argparse.Namespace, prompt_source: str) -> Dict[
     metadata = {
         "endpoint": args.endpoint,
         "api_format": args.api_format,
+        "processing_mode": args.processing_mode,
         "model": args.model,
         "justice_files_base_url": args.justice_files_base_url,
+        "source_files_base_url": args.source_files_base_url,
         "temperature": args.temperature,
         "max_parallel_requests": args.max_parallel_requests,
         "max_retries": args.max_retries,
         "retry_backoff": args.retry_backoff,
+        "image_max_pages": args.image_max_pages,
+        "image_render_dpi": args.image_render_dpi,
         "prompt_source": prompt_source,
     }
     if args.dataset_tag:
@@ -1308,6 +669,9 @@ def build_config_metadata(args: argparse.Namespace, prompt_source: str) -> Dict[
         "min_text_words": args.min_text_words,
         "min_alpha_ratio": args.min_alpha_ratio,
         "min_unique_word_ratio": args.min_unique_word_ratio,
+        "max_short_token_ratio": args.max_short_token_ratio,
+        "min_avg_word_length": args.min_avg_word_length,
+        "min_long_word_count": args.min_long_word_count,
         "max_repeated_char_run": args.max_repeated_char_run,
     }
     if args.api_key:
@@ -1416,6 +780,15 @@ def list_models(endpoint: str, api_key: Optional[str], timeout: float) -> None:
     response.raise_for_status()
     data = response.json()
     models = data.get("data", [])
+    if not models and isinstance(data.get("models"), list):
+        models = [
+            {
+                "id": entry.get("id") or entry.get("key"),
+                "created": entry.get("created"),
+            }
+            for entry in data["models"]
+            if isinstance(entry, dict)
+        ]
     if not models:
         print("No models reported by endpoint.")
         return
@@ -1522,7 +895,7 @@ def rebuild_manifest(chunk_dir: Path, manifest_path: Path) -> None:
 def build_output_records(
     *,
     idx: int,
-    source_row: Dict[str, str],
+    source_row: Dict[str, Any],
     result: Dict[str, Any],
     args: argparse.Namespace,
     config_metadata: Dict[str, Any],
@@ -1530,9 +903,15 @@ def build_output_records(
     processing_status: str,
     skip_reason: str,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    source_pdf_url = derive_justice_pdf_url(
+    justice_source_url = derive_justice_pdf_url(
         source_row.get("filename", ""), base_url=args.justice_files_base_url
     )
+    local_source_url = derive_local_source_url(
+        source_row.get("source_path"),
+        source_row.get("filename"),
+        source_files_base_url=getattr(args, "source_files_base_url", None),
+    )
+    source_url = justice_source_url or local_source_url
     key_insights = normalize_text_list(ensure_list(result.get("key_insights")))
     tags = normalize_text_list(ensure_list(result.get("tags")))
     power_mentions = normalize_text_list(
@@ -1551,7 +930,7 @@ def build_output_records(
     csv_row = {
         "filename": source_row["filename"],
         "source_row_index": idx,
-        "source_pdf_url": source_pdf_url or "",
+        "source_pdf_url": source_url or "",
         "processing_status": processing_status,
         "skip_reason": skip_reason,
         "headline": result.get("headline", ""),
@@ -1568,7 +947,7 @@ def build_output_records(
 
     json_record: Dict[str, Any] = {
         "filename": source_row["filename"],
-        "source_pdf_url": source_pdf_url,
+        "source_pdf_url": source_url,
         "headline": result.get("headline", ""),
         "importance_score": result.get("importance_score", ""),
         "reason": result.get("reason", ""),
@@ -1581,7 +960,9 @@ def build_output_records(
             "source_row_index": idx,
             "original_row": source_row,
             "config": config_metadata,
-            "source_pdf_url": source_pdf_url,
+            "source_pdf_url": source_url,
+            "justice_source_url": justice_source_url,
+            "local_source_url": local_source_url,
             "processing_status": processing_status,
             "skip_reason": skip_reason,
             "text_quality": quality,
@@ -1590,6 +971,30 @@ def build_output_records(
     if args.include_action_items:
         json_record["action_items"] = action_items
     return csv_row, json_record
+
+
+def resolve_processing_mode(args: argparse.Namespace) -> str:
+    if args.processing_mode in {"text", "image"}:
+        return args.processing_mode
+    if args.input.is_file():
+        return "text"
+
+    for row in iter_rows(
+        args.input,
+        input_glob=args.input_glob,
+        include_text=False,
+        processing_mode="auto",
+    ):
+        return row.get("input_kind", "text")
+
+    # Helpful fallback for image-only corpora when users keep the default *.txt glob.
+    if args.input_glob == "*.txt":
+        for pattern in ("*.pdf", "*.png", "*.jpg", "*.jpeg", "*.webp", "*.tif", "*.tiff", "*.bmp"):
+            first_match = next(args.input.rglob(pattern), None)
+            if first_match:
+                args.input_glob = pattern
+                return "image"
+    return "text"
 
 
 def main() -> None:
@@ -1607,6 +1012,10 @@ def main() -> None:
 
     if not args.input.exists():
         sys.exit(f"Input path not found: {args.input}")
+    active_processing_mode = resolve_processing_mode(args)
+    args.processing_mode = active_processing_mode
+    if args.source_files_base_url is not None and not str(args.source_files_base_url).strip():
+        args.source_files_base_url = None
     if args.dataset_metadata_file and not args.dataset_metadata_file.exists():
         sys.exit(f"Dataset metadata file not found: {args.dataset_metadata_file}")
     if args.max_parallel_requests < 1:
@@ -1623,8 +1032,23 @@ def main() -> None:
         sys.exit("--min-alpha-ratio must be >= 0")
     if args.min_unique_word_ratio < 0:
         sys.exit("--min-unique-word-ratio must be >= 0")
+    if args.max_short_token_ratio < 0 or args.max_short_token_ratio > 1:
+        sys.exit("--max-short-token-ratio must be between 0 and 1")
+    if args.min_avg_word_length < 0:
+        sys.exit("--min-avg-word-length must be >= 0")
+    if args.min_long_word_count < 0:
+        sys.exit("--min-long-word-count must be >= 0")
     if args.max_repeated_char_run < 1:
         sys.exit("--max-repeated-char-run must be >= 1")
+    if args.image_max_pages < 1:
+        sys.exit("--image-max-pages must be >= 1")
+    if args.image_render_dpi < 72:
+        sys.exit("--image-render-dpi must be >= 72")
+    if active_processing_mode == "image" and args.api_format == "chat":
+        sys.exit(
+            "Image mode is not supported with --api-format chat. "
+            "Use --api-format openai or --api-format auto."
+        )
     if args.start_row < 1:
         sys.exit("--start-row must be >= 1")
     if args.end_row is not None and args.end_row < args.start_row:
@@ -1653,6 +1077,30 @@ def main() -> None:
     args.json_output.parent.mkdir(parents=True, exist_ok=True)
     if args.checkpoint:
         args.checkpoint.parent.mkdir(parents=True, exist_ok=True)
+
+    if active_processing_mode == "image":
+        if args.skip_low_quality:
+            print("Image mode detected: skipping text-quality prefilter checks.", flush=True)
+        print(
+            f"Processing mode: image | glob: {args.input_glob} | "
+            f"PDF pages per file: {args.image_max_pages} | render DPI: {args.image_render_dpi}",
+            flush=True,
+        )
+        if (
+            "vl" not in args.model.lower()
+            and "vision" not in args.model.lower()
+            and "4.6v" not in args.model.lower()
+        ):
+            print(
+                f"WARNING: image mode is enabled but model '{args.model}' may be non-vision.",
+                flush=True,
+            )
+    else:
+        print(f"Processing mode: text | glob: {args.input_glob}", flush=True)
+    print(
+        f"Endpoint: {args.endpoint} | API format: {args.api_format} | Model: {args.model}",
+        flush=True,
+    )
 
     fieldnames = [
         "filename",
@@ -1685,6 +1133,7 @@ def main() -> None:
     workload_stats = calculate_workload(
         args.input,
         input_glob=args.input_glob,
+        processing_mode=active_processing_mode,
         max_rows=args.max_rows,
         completed_filenames=completed_filenames if args.resume else set(),
         start_row=args.start_row,
@@ -1708,12 +1157,20 @@ def main() -> None:
     # Count total rows in dataset for manifest metadata
     if output_router.mode == "chunk":
         print("Counting total rows in dataset...")
-        output_router.total_dataset_rows = count_total_rows(args.input, input_glob=args.input_glob)
+        output_router.total_dataset_rows = count_total_rows(
+            args.input,
+            input_glob=args.input_glob,
+            processing_mode=active_processing_mode,
+        )
         total_dataset_rows = output_router.total_dataset_rows
         print(f"Total dataset: {output_router.total_dataset_rows:,} rows")
     elif args.run_metadata_file:
         # Single-file mode still records total row count in run metadata.
-        total_dataset_rows = count_total_rows(args.input, input_glob=args.input_glob)
+        total_dataset_rows = count_total_rows(
+            args.input,
+            input_glob=args.input_glob,
+            processing_mode=active_processing_mode,
+        )
 
     checkpoint_handle = (
         args.checkpoint.open("a", encoding="utf-8") if args.checkpoint else None
@@ -1821,7 +1278,13 @@ def main() -> None:
 
     try:
         for idx, row in enumerate(
-            iter_rows(args.input, input_glob=args.input_glob, include_text=True), start=1
+            iter_rows(
+                args.input,
+                input_glob=args.input_glob,
+                include_text=True,
+                processing_mode=active_processing_mode,
+            ),
+            start=1,
         ):
             if idx < args.start_row:
                 continue
@@ -1832,6 +1295,8 @@ def main() -> None:
 
             filename = row["filename"]
             text = row["text"]
+            input_kind = row.get("input_kind", "text")
+            source_path = Path(row["source_path"]) if row.get("source_path") else None
 
             if filename in completed_filenames:
                 print(f"[Row {idx}] [skip] {filename} already processed.", flush=True)
@@ -1840,8 +1305,22 @@ def main() -> None:
             scheduled += 1
             emit_order.append(idx)
 
-            quality = assess_text_quality(text)
-            skip_reason = build_skip_reason(quality, args) if args.skip_low_quality else None
+            if input_kind == "text":
+                quality = assess_text_quality(text)
+                skip_reason = build_skip_reason(quality, args) if args.skip_low_quality else None
+            else:
+                quality = {
+                    "mode": "image",
+                    "char_count": 0,
+                    "word_count": 0,
+                    "avg_word_length": 0,
+                    "alpha_ratio": 0,
+                    "unique_word_ratio": 0,
+                    "short_token_ratio": 0,
+                    "long_word_count": 0,
+                    "max_repeated_char_run": 0,
+                }
+                skip_reason = None
             if skip_reason:
                 print(f"[Row {idx}] [skip] {filename}: {skip_reason}", flush=True)
                 pending_results[idx] = {
@@ -1876,6 +1355,10 @@ def main() -> None:
                 "model": args.model,
                 "filename": filename,
                 "text": text,
+                "input_kind": input_kind,
+                "image_path": source_path if input_kind == "image" else None,
+                "image_max_pages": args.image_max_pages,
+                "image_render_dpi": args.image_render_dpi,
                 "system_prompt": system_prompt,
                 "api_key": args.api_key,
                 "timeout": args.timeout,
@@ -1914,6 +1397,10 @@ def main() -> None:
                     model=args.model,
                     filename=filename,
                     text=text,
+                    input_kind=input_kind,
+                    image_path=source_path if input_kind == "image" else None,
+                    image_max_pages=args.image_max_pages,
+                    image_render_dpi=args.image_render_dpi,
                     system_prompt=system_prompt,
                     api_key=args.api_key,
                     timeout=args.timeout,

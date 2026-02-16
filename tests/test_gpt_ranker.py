@@ -16,6 +16,9 @@ class GptRankerHelpersTest(unittest.TestCase):
             min_text_words=12,
             min_alpha_ratio=0.25,
             min_unique_word_ratio=0.15,
+            max_short_token_ratio=0.6,
+            min_avg_word_length=3.0,
+            min_long_word_count=4,
             max_repeated_char_run=40,
             include_action_items=False,
             justice_files_base_url=gpt_ranker.DEFAULT_JUSTICE_FILES_BASE_URL,
@@ -52,11 +55,38 @@ class GptRankerHelpersTest(unittest.TestCase):
         self.assertEqual(rows[0]["filename"], "one.txt")
         self.assertEqual(rows[1]["text"], "world")
 
+    def test_iter_rows_supports_image_mode_directory_input(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            image_pdf = root / "doc.pdf"
+            image_pdf.write_bytes(b"%PDF-1.4\n")
+            rows = list(
+                gpt_ranker.iter_rows(
+                    root,
+                    input_glob="*.pdf",
+                    include_text=True,
+                    processing_mode="image",
+                )
+            )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["input_kind"], "image")
+        self.assertEqual(rows[0]["text"], "")
+
     def test_skip_reason_flags_low_quality_rows(self) -> None:
         quality = gpt_ranker.assess_text_quality("x")
         reason = gpt_ranker.build_skip_reason(quality, self.skip_args)
         self.assertIsNotNone(reason)
         self.assertIn("too short", reason)
+
+    def test_skip_reason_flags_ocr_noise_tokens(self) -> None:
+        text = "~ © B S)Geeeee ee A go 6 4 ls * . ; errr : id ° N + oO oO oO oO oO oO << = Ww Lu."
+        quality = gpt_ranker.assess_text_quality(text)
+        reason = gpt_ranker.build_skip_reason(quality, self.skip_args)
+        self.assertIsNotNone(reason)
+        self.assertTrue(
+            "too many short/noisy tokens" in reason
+            or "average token length too low/noisy OCR" in reason
+        )
 
     def test_skip_reason_allows_normal_text(self) -> None:
         text = (
@@ -99,6 +129,17 @@ class GptRankerHelpersTest(unittest.TestCase):
 
     def test_derive_justice_pdf_url_returns_none_when_unmatched(self) -> None:
         self.assertIsNone(gpt_ranker.derive_justice_pdf_url("notes/no_match.txt"))
+
+    def test_derive_local_source_url_maps_data_path(self) -> None:
+        source_url = gpt_ranker.derive_local_source_url(
+            "/tmp/project/source/data/new_data/VOL00001/IMAGES/0001/EFTA00000001.pdf",
+            "IMAGES/0001/EFTA00000001.pdf",
+            source_files_base_url=None,
+        )
+        self.assertEqual(
+            source_url,
+            "/data/new_data/VOL00001/IMAGES/0001/EFTA00000001.pdf",
+        )
 
     def test_cli_explicit_default_value_overrides_config(self) -> None:
         original_argv = sys.argv[:]
@@ -234,6 +275,10 @@ class GptRankerHelpersTest(unittest.TestCase):
                 model="qwen/qwen3-coder-next",
                 filename="DataSet10/EFTA00000001.txt",
                 text="Some useful text with enough detail for scoring.",
+                input_kind="text",
+                image_path=None,
+                image_max_pages=1,
+                image_render_dpi=180,
                 system_prompt="Return JSON",
                 api_key=None,
                 timeout=30,
@@ -272,6 +317,10 @@ class GptRankerHelpersTest(unittest.TestCase):
                 model="qwen/qwen3-coder-next",
                 filename="DataSet10/EFTA00000001.txt",
                 text="Some useful text with enough detail for scoring.",
+                input_kind="text",
+                image_path=None,
+                image_max_pages=1,
+                image_render_dpi=180,
                 system_prompt="Return JSON",
                 api_key=None,
                 timeout=30,
@@ -310,6 +359,10 @@ class GptRankerHelpersTest(unittest.TestCase):
                 model="qwen/qwen3-coder-next",
                 filename="DataSet10/EFTA00000001.txt",
                 text="Some useful text with enough detail for scoring.",
+                input_kind="text",
+                image_path=None,
+                image_max_pages=1,
+                image_render_dpi=180,
                 system_prompt="Return JSON",
                 api_key=None,
                 timeout=30,
@@ -321,6 +374,28 @@ class GptRankerHelpersTest(unittest.TestCase):
             )
         self.assertEqual(result["headline"], "h")
         self.assertEqual(mocked_post.call_count, 2)
+
+    def test_call_model_image_mode_rejects_chat_api(self) -> None:
+        with self.assertRaises(RuntimeError):
+            gpt_ranker.call_model(
+                endpoint="http://localhost:5555/api/v1",
+                api_format="chat",
+                model="qwen/qwen3-vl-30b",
+                filename="IMAGES/0001/EFTA00000001.pdf",
+                text="",
+                input_kind="image",
+                image_path=Path("/tmp/nope.pdf"),
+                image_max_pages=1,
+                image_render_dpi=180,
+                system_prompt="Return JSON",
+                api_key=None,
+                timeout=30,
+                max_retries=1,
+                retry_backoff=0,
+                temperature=0.0,
+                reasoning_effort=None,
+                config_metadata=None,
+            )
 
 
 if __name__ == "__main__":

@@ -1,10 +1,12 @@
 # Sample configuration for gpt_ranker.py
 
 # Endpoint / model overrides
-endpoint = "http://localhost:5555/api/v1"
-api_format = "auto" # "auto", "openai", or "chat"
-model = "qwen/qwen3-coder-next"
+endpoint = "http://localhost:5555/v1"
+api_format = "openai" # "auto", "openai", or "chat"
+model = "qwen/qwen3-vl-30b"
+processing_mode = "image" # "auto", "text", or "image"
 justice_files_base_url = "https://www.justice.gov/epstein/files"
+source_files_base_url = "" # Optional hosted base URL for local files (leave blank for auto /data/... derivation)
 max_parallel_requests = 4
 temperature = 0.4  # Temperature for model responses (0.0 = deterministic, higher = more random)
 reasoning_effort = "low"  # Optional: "low", "medium", or "high" (omit if model doesn't support it)
@@ -13,6 +15,8 @@ timeout = 1200.0  # HTTP request timeout in seconds (10 minutes)
                  # For very large documents (100K+ tokens), increase to 1200 (20 min) or higher
 max_retries = 3
 retry_backoff = 1.5
+image_max_pages = 1
+image_render_dpi = 180
 
 # Low-signal skipping safeguards
 skip_low_quality = true
@@ -20,6 +24,9 @@ min_text_chars = 60
 min_text_words = 12
 min_alpha_ratio = 0.25
 min_unique_word_ratio = 0.15
+max_short_token_ratio = 0.6
+min_avg_word_length = 3.0
+min_long_word_count = 4
 max_repeated_char_run = 40
 
 # System prompt configuration
@@ -40,8 +47,8 @@ electric_rate = 0.25
 # run_hours = 60.0
 
 # Paths
-input = "data/EPS_FILES_20K_NOV2026.csv"
-input_glob = "*.txt"  # Used only when input is a directory
+input = "data/new_data/VOL00001"
+input_glob = "*.pdf"  # Used when input is a directory
 output = "data/epstein_ranked.csv"
 json_output = "data/epstein_ranked.jsonl"
 checkpoint = "data/.epstein_checkpoint"

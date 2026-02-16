@@ -5,7 +5,7 @@
 LLM-powered tooling for triaging the **U.S. House Oversight Epstein Estate** document release.
 This project:
 
-1. Streams the document corpus through a locally hosted, open-source model (`qwen/qwen3-coder-next` running via **LM Studio**) to produce ranked, structured leads.
+1. Streams the document corpus through locally hosted open-source models (default vision run: `qwen/qwen3-vl-30b` via **LM Studio**) to produce ranked, structured leads.
 2. Ships a dashboard (`viewer/`) so investigators can filter, chart, and inspect every scored document (including the full source text) offline.
 
 The entire workflow operates on a single MacBook Pro (M3 Max, 128 GB RAM). With an average draw of ~100 W, a 60-hour pass consumes ≈6 kWh (~$1.50 at SoCal off-peak rates) with zero cloud/API spend.
@@ -60,7 +60,7 @@ Huge thanks to **tensonaut** for the foundational OCR and dataset packaging; thi
 
 - Python 3.9+
 - `requests`
-- LM Studio (or another local gateway) serving `qwen/qwen3-coder-next` locally at `http://localhost:5555/api/v1`
+- LM Studio (or another local gateway) serving your selected model locally (for vision runs: `qwen/qwen3-vl-30b` via OpenAI-compatible `http://localhost:5555/v1`)
 - The dataset CSV (`data/EPS_FILES_20K_NOV2026.csv`). **Not included in this repo**—download it from the Hugging Face link above and place it in `data/` (see `data/README.md` for instructions).
 
 Install Python deps (only `requests` is needed):
@@ -76,18 +76,29 @@ python -m pip install -r requirements.txt  # or just: python -m pip install requ
 ```bash
 cp ranker_config.example.toml ranker_config.toml  # optional defaults
 python gpt_ranker.py \
-  --input data/EPS_FILES_20K_NOV2026.csv \
+  --input data/new_data/VOL00001 \
+  --input-glob "*.pdf" \
+  --processing-mode image \
   --output data/epstein_ranked.csv \
   --json-output data/epstein_ranked.jsonl \
-  --endpoint http://localhost:5555/api/v1 \
-  --api-format auto \
-  --model qwen/qwen3-coder-next \
+  --endpoint http://localhost:5555/v1 \
+  --api-format openai \
+  --model qwen/qwen3-vl-30b \
   --max-parallel-requests 4 \
+  --image-max-pages 1 \
+  --image-render-dpi 180 \
   --resume \
   --sleep 0.5 \
   --config ranker_config.toml \
   --reasoning-effort low
 ```
+
+## Code layout
+
+- `gpt_ranker.py`: orchestration pipeline / entrypoint.
+- `ranker/cli.py`: CLI parsing + config/workspace default resolution.
+- `ranker/model_client.py`: endpoint fallback, retries, text/vision request building.
+- `ranker/constants.py`: canonical maps and shared constants.
 
 By default, the ranker writes **1,000-row chunks** to `contrib/` and updates `data/chunks.json`.  
 Set `--chunk-size 0` if you really want a single CSV/JSONL output (not recommended for sharing).
@@ -96,19 +107,22 @@ Notable flags:
 
 - `--prompt-file`: specify a custom system prompt file (defaults to `prompts/default_system_prompt.txt`). See `prompts/README.md` for details on creating custom prompts.
 - `--system-prompt`: provide an inline system prompt string (overrides `--prompt-file`).
-- `--input`: accepts either the legacy CSV (`filename` + `text`) or a directory tree of `.txt` files.
+- `--input`: accepts the legacy CSV (`filename` + `text`) or a directory tree of `.txt`, `.pdf`, and image files.
 - `--input-glob`: glob pattern used when `--input` is a directory (default `*.txt`, recursive).
+- `--processing-mode`: `auto`, `text`, or `image`. Use `image` for PDF/image-first workflows.
 - `--dataset-workspace-root` + `--dataset-tag`: isolate this corpus into its own workspace (`results/`, `chunks/`, `state/`, `metadata/`) so outputs do not mix with the oversight dataset.
 - `--dataset-source-label`, `--dataset-source-url`, `--dataset-metadata-file`: attach provenance details; if `--run-metadata-file` is set (or auto-set in workspace mode), a run metadata JSON is written.
 - `--resume`: skips rows already present in the JSONL/checkpoint so you can stop/restart long runs.
 - `--checkpoint data/.epstein_checkpoint`: stores processed filenames to guard against duplication.
 - `--reasoning-effort low/high`: trade accuracy for speed if your model exposes the reasoning control knob.
 - `--max-parallel-requests`: number of concurrent requests to LM Studio (default `4`).
-- `--api-format`: `auto` (default), `openai`, or `chat`. Use `chat` for LM Studio `/api/v1/chat` style endpoints.
+- `--api-format`: `auto` (default), `openai`, or `chat`. Vision/image mode requires `openai` (or `auto`, which resolves to OpenAI format).
+- `--image-max-pages`, `--image-render-dpi`: configure PDF page rendering for multimodal inference.
 - `--max-retries`, `--retry-backoff`: retry transient endpoint failures with exponential backoff.
 - `--skip-low-quality` / `--no-skip-low-quality`: enable/disable pre-LLM filtering for empty/short/noisy OCR rows.
-- `--min-text-chars`, `--min-text-words`, `--min-alpha-ratio`, `--min-unique-word-ratio`, `--max-repeated-char-run`: tune skip thresholds.
+- `--min-text-chars`, `--min-text-words`, `--min-alpha-ratio`, `--min-unique-word-ratio`, `--max-short-token-ratio`, `--min-avg-word-length`, `--min-long-word-count`, `--max-repeated-char-run`: tune skip thresholds (helps skip OCR gibberish with mostly short tokens).
 - `--justice-files-base-url`: base URL used to derive DOJ PDF links (stored as `source_pdf_url` and shown in the viewer).
+- `--source-files-base-url`: optional hosted base URL for local files when DOJ URL derivation is unavailable.
 - `--include-action-items`: opt-in if you want the LLM to list action items (off by default for brevity).
 - `--timeout`: HTTP request timeout in seconds (default: 600 = 10 minutes). Increase for very large documents (100K+ tokens).
 - `--max-rows N`: smoke-test on a small subset.
@@ -192,8 +206,7 @@ See `prompts/README.md` for detailed guidance on creating custom prompts, and ch
 The ranker loads prompts in this order of priority:
 1. `--system-prompt` (inline string argument)
 2. `--prompt-file` or `prompt_file` in config
-3. `prompts/default_system_prompt.txt` (if it exists)
-4. Hardcoded default prompt (fallback)
+3. `prompts/default_system_prompt.txt` (required default prompt file)
 
 ### Tracking prompt usage
 

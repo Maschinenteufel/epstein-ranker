@@ -130,7 +130,7 @@
         <div>
           <p class="detail-label">Selected File</p>
           <h2 id="detailTitle">Select a row to inspect full context</h2>
-          <p class="detail-hint">Click any row in the table to load its full reasoning and source text.</p>
+          <p class="detail-hint">Click any row in the table to load reasoning and source metadata.</p>
         </div>
         <button id="detailClose" type="button">Close</button>
       </div>
@@ -152,10 +152,10 @@
           <p id="detailTags">—</p>
           <h3>Model</h3>
           <p id="detailModel">—</p>
-          <h3>Justice PDF</h3>
+          <h3>Source File</h3>
           <p><a id="detailSourceUrl" href="#" target="_blank" rel="noopener noreferrer">—</a></p>
         </article>
-        <article class="detail-text">
+        <article id="detailTextPanel" class="detail-text">
           <div class="detail-text-header">
             <h3>Original Text</h3>
             <button id="detailTextToggle" type="button" class="text-toggle">Expand</button>
@@ -189,8 +189,8 @@
       <details class="methodology-collapse">
         <summary>How the Importance Score Works</summary>
         <p>
-          Each document is analyzed locally through LM Studio using the open-source Qwen3 Coder Next model, running entirely offline on
-          commodity hardware. The model scores passages from 0 (no meaningful lead) to 100 (critical revelation).
+          Documents are analyzed locally through LM Studio using open-source Qwen-family models. The pipeline supports both OCR text and
+          image/PDF-first processing, then scores each item from 0 (no actionable lead) to 100 (critical lead).
         </p>
         <details class="accordion" open>
           <summary>Scoring criteria (click to toggle)</summary>
@@ -205,31 +205,16 @@
         <details class="accordion">
           <summary>LLM prompt (full text)</summary>
           <pre>
-You analyze primary documents related to court and investigative filings.
-Focus on whether the passage offers potential leads—even if unverified—that connect influential actors (presidents, cabinet officials, foreign leaders, billionaires, intelligence agencies) to controversial actions, financial flows, or possible misconduct.
-Score each passage on:
-  1. Investigative usefulness: Does it suggest concrete follow-up steps, names, transactions, dates, or relationships worth pursuing?
-  2. Controversy / sensitivity: Would the lead cause public outcry or legal risk if validated?
-  3. Novelty: Is this information new or rarely reported, versus already known?
-  4. Power linkage: Does it implicate high-ranking officials or major power centers? Leads tying unknown individuals only to minor issues should score lower.
-Assign an importance_score from 0 (no meaningful lead) to 100 (blockbuster lead linking powerful actors to fresh controversy). Reserve 70+ for claims that, if true, would represent major revelations or next-step investigations.
-Use the scale consistently:
-  • 0–10  : noise, duplicates, previously published facts, or gossip with no actors.
-  • 10–30 : low-value context; speculative or weak leads lacking specifics.
-  • 30–50 : moderate leads with partial details or missing novelty.
-  • 50–70 : strong leads with actionable info or notable controversy.
-  • 70–85 : high-impact, new revelations tying powerful actors to clear misconduct.
-  • 85–100: blockbuster revelations demanding immediate follow-up.
-Return strict JSON with the following fields:
-  - headline (string)
-  - importance_score (0-100 number)
-  - reason (string explaining score)
-  - key_insights (array of short bullet strings)
-  - tags (array of topical strings)
-  - power_mentions (array listing high-profile people or institutions mentioned; include titles or roles if possible)
-  - agency_involvement (array naming government, intelligence, or law-enforcement bodies involved or implicated)
-  - lead_types (array describing lead categories such as 'financial flow', 'legal exposure', 'foreign influence', 'sexual misconduct', etc.)
-If a category has no data, return an empty array for it.
+You are an investigative triage model.
+Input can be OCR text or document page images.
+Use only explicit evidence in the input.
+Do not invent names, agencies, dates, or amounts.
+If unreadable/low-signal, score low and explain why.
+Return JSON only with exactly:
+headline, importance_score, reason, key_insights, tags,
+power_mentions, agency_involvement, lead_types.
+importance_score is an integer 0-100.
+Use conservative scoring when evidence is weak.
           </pre>
         </details>
       </details>
