@@ -4,13 +4,15 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import csv
 import json
 import re
 import sys
 import time
+from collections import deque
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Deque, Dict, Iterable, List, Optional, Set, Tuple
 
 try:
     import tomllib  # Python 3.11+
@@ -131,8 +133,77 @@ AGENCY_CANONICAL_MAP = {
     "NYPD": {"nypd", "new york police department"},
 }
 
+DEFAULT_JUSTICE_FILES_BASE_URL = "https://www.justice.gov/epstein/files"
 
-def apply_config_defaults(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+
+def explicit_cli_destinations(argv: List[str]) -> Set[str]:
+    explicit: Set[str] = set()
+    for token in argv:
+        if token == "--":
+            break
+        if not token.startswith("--"):
+            continue
+        flag = token[2:]
+        if "=" in flag:
+            flag = flag.split("=", 1)[0]
+        if flag.startswith("no-"):
+            flag = flag[3:]
+        explicit.add(flag.replace("-", "_"))
+    return explicit
+
+
+def sanitize_dataset_tag(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip())
+    cleaned = cleaned.strip("._-")
+    return cleaned or "dataset"
+
+
+def infer_dataset_tag(input_path: Path) -> str:
+    if input_path.name:
+        stem = input_path.stem if input_path.is_file() else input_path.name
+        if stem:
+            return sanitize_dataset_tag(stem)
+    return "dataset"
+
+
+def apply_dataset_workspace_defaults(
+    args: argparse.Namespace,
+    *,
+    cli_explicit: Optional[Set[str]] = None,
+) -> None:
+    explicit = cli_explicit or set()
+    if not args.dataset_workspace_root:
+        return
+
+    workspace_root = Path(args.dataset_workspace_root)
+    tag = args.dataset_tag or infer_dataset_tag(args.input)
+    tag = sanitize_dataset_tag(tag)
+    args.dataset_tag = tag
+    base = workspace_root / tag
+
+    workspace_defaults = {
+        "output": base / "results" / "epstein_ranked.csv",
+        "json_output": base / "results" / "epstein_ranked.jsonl",
+        "checkpoint": base / "state" / ".epstein_checkpoint",
+        "chunk_dir": base / "chunks",
+        "chunk_manifest": base / "metadata" / "chunks.json",
+        "run_metadata_file": base / "metadata" / "run_metadata.json",
+    }
+    for key, value in workspace_defaults.items():
+        if key not in explicit:
+            setattr(args, key, value)
+
+    # Prevent accidental overlap with other corpora when using isolated workspaces.
+    if "known_json" not in explicit:
+        args.known_json = []
+
+
+def apply_config_defaults(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+    cli_explicit: Optional[Set[str]] = None,
+) -> None:
+    explicit = cli_explicit or set()
     config_path: Path = args.config  # type: ignore[assignment]
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
@@ -140,6 +211,8 @@ def apply_config_defaults(parser: argparse.ArgumentParser, args: argparse.Namesp
         data = tomllib.load(handle)
     for key, value in data.items():
         if not hasattr(args, key):
+            continue
+        if key in explicit:
             continue
         current = getattr(args, key)
         default = parser.get_default(key)
@@ -153,8 +226,8 @@ def apply_config_defaults(parser: argparse.ArgumentParser, args: argparse.Namesp
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Call a local OpenAI-compatible server (e.g. gpt-oss-120b) to extract "
-            "useful information and rank each CSV row."
+            "Call a local OpenAI-compatible server (e.g. qwen/qwen3-coder-next) to extract "
+            "useful information and rank each source row."
         )
     )
     parser.add_argument(
@@ -166,7 +239,48 @@ def parse_args() -> argparse.Namespace:
         "--input",
         type=Path,
         default=Path("data") / "EPS_FILES_20K_NOV2026.csv",
-        help="Path to the source CSV with 'filename' and 'text' columns.",
+        help="Path to the source CSV (filename/text columns) or a directory of .txt files.",
+    )
+    parser.add_argument(
+        "--input-glob",
+        default="*.txt",
+        help="Glob used when --input points to a directory (searched recursively).",
+    )
+    parser.add_argument(
+        "--dataset-workspace-root",
+        type=Path,
+        default=None,
+        help=(
+            "If set, isolate outputs/checkpoint/chunks under "
+            "<dataset-workspace-root>/<dataset-tag>/ to avoid mixing corpora."
+        ),
+    )
+    parser.add_argument(
+        "--dataset-tag",
+        default=None,
+        help="Dataset identifier used with --dataset-workspace-root (defaults to input name).",
+    )
+    parser.add_argument(
+        "--dataset-source-label",
+        default=None,
+        help="Optional human-readable source label for provenance metadata.",
+    )
+    parser.add_argument(
+        "--dataset-source-url",
+        default=None,
+        help="Optional source URL for provenance metadata.",
+    )
+    parser.add_argument(
+        "--dataset-metadata-file",
+        type=Path,
+        default=None,
+        help="Optional JSON file containing dataset provenance/stats to attach to run metadata.",
+    )
+    parser.add_argument(
+        "--run-metadata-file",
+        type=Path,
+        default=None,
+        help="Optional JSON sidecar path for run metadata (auto-set in workspace mode).",
     )
     parser.add_argument(
         "--output",
@@ -187,8 +301,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model",
-        default="openai/gpt-oss-120b",
+        default="qwen/qwen3-coder-next",
         help="Model identifier exposed by the server (check via --list-models).",
+    )
+    parser.add_argument(
+        "--justice-files-base-url",
+        default=DEFAULT_JUSTICE_FILES_BASE_URL,
+        help="Base URL for DOJ Epstein PDF files used to derive source document links.",
+    )
+    parser.add_argument(
+        "--max-parallel-requests",
+        type=int,
+        default=4,
+        help="Maximum concurrent model requests.",
     )
     parser.add_argument(
         "--temperature",
@@ -293,6 +418,49 @@ def parse_args() -> argparse.Namespace:
         help="HTTP request timeout in seconds (default: 600 = 10 minutes).",
     )
     parser.add_argument(
+        "--skip-low-quality",
+        dest="skip_low_quality",
+        action="store_true",
+        default=True,
+        help="Skip low-signal rows (empty/too-short/noisy) before model calls.",
+    )
+    parser.add_argument(
+        "--no-skip-low-quality",
+        dest="skip_low_quality",
+        action="store_false",
+        help="Disable low-quality row skipping.",
+    )
+    parser.add_argument(
+        "--min-text-chars",
+        type=int,
+        default=60,
+        help="Minimum non-whitespace character count required to process a row.",
+    )
+    parser.add_argument(
+        "--min-text-words",
+        type=int,
+        default=12,
+        help="Minimum token count required to process a row.",
+    )
+    parser.add_argument(
+        "--min-alpha-ratio",
+        type=float,
+        default=0.25,
+        help="Minimum alphabetic-character ratio required to process a row.",
+    )
+    parser.add_argument(
+        "--min-unique-word-ratio",
+        type=float,
+        default=0.15,
+        help="Minimum unique-word ratio required to process a row.",
+    )
+    parser.add_argument(
+        "--max-repeated-char-run",
+        type=int,
+        default=40,
+        help="Maximum repeated-character run before a row is considered noisy.",
+    )
+    parser.add_argument(
         "--list-models",
         action="store_true",
         help="List models exposed by the endpoint and exit.",
@@ -321,6 +489,7 @@ def parse_args() -> argparse.Namespace:
         help="Override elapsed hours for cost estimate (otherwise uses wall time).",
     )
     args = parser.parse_args()
+    cli_explicit = explicit_cli_destinations(sys.argv[1:])
     config_path = None
     if args.config:
         config_path = Path(args.config)
@@ -331,7 +500,8 @@ def parse_args() -> argparse.Namespace:
                 break
     if config_path:
         args.config = config_path
-        apply_config_defaults(parser, args)
+        apply_config_defaults(parser, args, cli_explicit=cli_explicit)
+    apply_dataset_workspace_defaults(args, cli_explicit=cli_explicit)
     return args
 
 
@@ -447,13 +617,29 @@ def ensure_json_dict(content: str) -> Dict[str, Any]:
     return parsed
 
 
-def iter_rows(path: Path) -> Iterable[Dict[str, str]]:
+def iter_rows(path: Path, *, input_glob: str = "*.txt", include_text: bool = True) -> Iterable[Dict[str, str]]:
+    if path.is_dir():
+        for file_path in sorted(path.rglob(input_glob)):
+            if not file_path.is_file():
+                continue
+            row: Dict[str, str] = {
+                "filename": file_path.relative_to(path).as_posix(),
+                "text": "",
+            }
+            if include_text:
+                row["text"] = file_path.read_text(encoding="utf-8", errors="replace")
+            yield row
+        return
+
     with path.open(newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
         for row in reader:
             if "text" not in row or "filename" not in row:
                 raise ValueError("Input CSV must contain 'filename' and 'text' columns.")
-            yield row
+            if include_text:
+                yield row
+            else:
+                yield {"filename": row["filename"], "text": ""}
 
 
 def load_checkpoint(path: Optional[Path]) -> Set[str]:
@@ -565,8 +751,103 @@ def normalize_text_list(values: List[str], *, strip_descriptor: bool = False) ->
     return normalized
 
 
-def count_total_csv_rows(path: Path) -> int:
-    """Count total number of data rows in the CSV (excluding header)."""
+def max_repeated_char_run(text: str) -> int:
+    longest = 0
+    current = 0
+    prev = ""
+    for ch in text:
+        if ch == prev:
+            current += 1
+        else:
+            current = 1
+            prev = ch
+        if current > longest:
+            longest = current
+    return longest
+
+
+def assess_text_quality(text: str) -> Dict[str, Any]:
+    compact = " ".join((text or "").split())
+    char_count = len(compact)
+    tokens = re.findall(r"[A-Za-z0-9]+(?:'[A-Za-z0-9]+)?", compact)
+    word_count = len(tokens)
+    alpha_count = sum(1 for ch in compact if ch.isalpha())
+    unique_word_count = len({token.lower() for token in tokens})
+    alpha_ratio = (alpha_count / char_count) if char_count else 0.0
+    unique_word_ratio = (unique_word_count / word_count) if word_count else 0.0
+    repeated_run = max_repeated_char_run(compact)
+    return {
+        "char_count": char_count,
+        "word_count": word_count,
+        "alpha_ratio": round(alpha_ratio, 4),
+        "unique_word_ratio": round(unique_word_ratio, 4),
+        "max_repeated_char_run": repeated_run,
+    }
+
+
+def build_skip_reason(quality: Dict[str, Any], args: argparse.Namespace) -> Optional[str]:
+    if quality["char_count"] == 0:
+        return "empty text"
+    if quality["char_count"] < args.min_text_chars:
+        return (
+            f"too short ({quality['char_count']} chars < minimum {args.min_text_chars})"
+        )
+    if quality["word_count"] < args.min_text_words:
+        return (
+            f"too few words ({quality['word_count']} words < minimum {args.min_text_words})"
+        )
+    if quality["alpha_ratio"] < args.min_alpha_ratio:
+        return (
+            f"low alphabetic density ({quality['alpha_ratio']:.2f} < minimum {args.min_alpha_ratio:.2f})"
+        )
+    if quality["word_count"] > 0 and quality["unique_word_ratio"] < args.min_unique_word_ratio:
+        return (
+            "high repetition/noise "
+            f"({quality['unique_word_ratio']:.2f} unique ratio < minimum {args.min_unique_word_ratio:.2f})"
+        )
+    if quality["max_repeated_char_run"] > args.max_repeated_char_run:
+        return (
+            "contains long repeated-character sequences "
+            f"({quality['max_repeated_char_run']} > max {args.max_repeated_char_run})"
+        )
+    return None
+
+
+def build_skipped_model_result(skip_reason: str) -> Dict[str, Any]:
+    return {
+        "headline": "Skipped low-signal document",
+        "importance_score": 0,
+        "reason": f"Skipped before model call: {skip_reason}.",
+        "key_insights": [],
+        "tags": ["skipped"],
+        "power_mentions": [],
+        "agency_involvement": [],
+        "lead_types": [],
+    }
+
+
+def derive_justice_pdf_url(filename: str, base_url: str = DEFAULT_JUSTICE_FILES_BASE_URL) -> Optional[str]:
+    if not filename:
+        return None
+    dataset_match = re.search(r"DataSet\s*0*(\d+)", filename, flags=re.IGNORECASE)
+    efta_match = re.search(r"(EFTA\d{8})", filename, flags=re.IGNORECASE)
+    if not dataset_match or not efta_match:
+        return None
+    try:
+        dataset_num = int(dataset_match.group(1))
+    except ValueError:
+        return None
+    if dataset_num < 1:
+        return None
+    efta_id = efta_match.group(1).upper()
+    base = base_url.rstrip("/")
+    return f"{base}/DataSet%20{dataset_num}/{efta_id}.pdf"
+
+
+def count_total_rows(path: Path, *, input_glob: str = "*.txt") -> int:
+    """Count total number of source rows for CSV or directory input."""
+    if path.is_dir():
+        return sum(1 for _ in iter_rows(path, input_glob=input_glob, include_text=False))
     with path.open(newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
         return sum(1 for _ in reader)
@@ -575,6 +856,7 @@ def count_total_csv_rows(path: Path) -> int:
 def calculate_workload(
     path: Path,
     *,
+    input_glob: str,
     max_rows: Optional[int],
     completed_filenames: Set[str],
     start_row: int,
@@ -582,18 +864,16 @@ def calculate_workload(
 ) -> Dict[str, int]:
     total = 0
     already_done = 0
-    with path.open(newline="", encoding="utf-8") as handle:
-        reader = csv.DictReader(handle)
-        for idx, row in enumerate(reader, start=1):
-            if idx < start_row:
-                continue
-            if end_row is not None and idx > end_row:
-                break
-            total += 1
-            if completed_filenames and row.get("filename") in completed_filenames:
-                already_done += 1
-            if max_rows is not None and total >= max_rows:
-                break
+    for idx, row in enumerate(iter_rows(path, input_glob=input_glob, include_text=False), start=1):
+        if idx < start_row:
+            continue
+        if end_row is not None and idx > end_row:
+            break
+        total += 1
+        if completed_filenames and row.get("filename") in completed_filenames:
+            already_done += 1
+        if max_rows is not None and total >= max_rows:
+            break
     workload = max(0, total - already_done)
     return {"total": total, "already_done": already_done, "workload": workload}
 
@@ -801,11 +1081,29 @@ def build_config_metadata(args: argparse.Namespace, prompt_source: str) -> Dict[
     metadata = {
         "endpoint": args.endpoint,
         "model": args.model,
+        "justice_files_base_url": args.justice_files_base_url,
         "temperature": args.temperature,
+        "max_parallel_requests": args.max_parallel_requests,
         "prompt_source": prompt_source,
     }
+    if args.dataset_tag:
+        metadata["dataset_tag"] = args.dataset_tag
+    if args.dataset_workspace_root:
+        metadata["dataset_workspace_root"] = str(args.dataset_workspace_root)
+    if args.dataset_source_label:
+        metadata["dataset_source_label"] = args.dataset_source_label
+    if args.dataset_source_url:
+        metadata["dataset_source_url"] = args.dataset_source_url
     if args.reasoning_effort is not None:
         metadata["reasoning_effort"] = args.reasoning_effort
+    metadata["skip_low_quality"] = args.skip_low_quality
+    metadata["skip_thresholds"] = {
+        "min_text_chars": args.min_text_chars,
+        "min_text_words": args.min_text_words,
+        "min_alpha_ratio": args.min_alpha_ratio,
+        "min_unique_word_ratio": args.min_unique_word_ratio,
+        "max_repeated_char_run": args.max_repeated_char_run,
+    }
     if args.api_key:
         metadata["api_key_used"] = True
     if args.power_watts is not None:
@@ -813,6 +1111,64 @@ def build_config_metadata(args: argparse.Namespace, prompt_source: str) -> Dict[
     if args.electric_rate is not None:
         metadata["electric_rate"] = args.electric_rate
     return metadata
+
+
+def load_dataset_profile(path: Optional[Path]) -> Optional[Dict[str, Any]]:
+    if not path:
+        return None
+    if not path.exists():
+        raise FileNotFoundError(f"Dataset metadata file not found: {path}")
+    with path.open(encoding="utf-8") as handle:
+        data = json.load(handle)
+    if not isinstance(data, dict):
+        raise ValueError(f"Dataset metadata file must contain a JSON object: {path}")
+    return data
+
+
+def write_run_metadata(
+    *,
+    args: argparse.Namespace,
+    prompt_source: str,
+    config_metadata: Dict[str, Any],
+    workload_stats: Dict[str, int],
+    total_dataset_rows: Optional[int],
+    dataset_profile: Optional[Dict[str, Any]],
+) -> None:
+    if not args.run_metadata_file:
+        return
+
+    payload: Dict[str, Any] = {
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "dataset": {
+            "tag": args.dataset_tag,
+            "source_label": args.dataset_source_label,
+            "source_url": args.dataset_source_url,
+        },
+        "input": {
+            "path": str(args.input),
+            "is_directory": args.input.is_dir(),
+            "input_glob": args.input_glob if args.input.is_dir() else None,
+            "total_rows": total_dataset_rows if total_dataset_rows is not None else "unknown",
+        },
+        "workload": workload_stats,
+        "outputs": {
+            "output_csv": str(args.output),
+            "output_jsonl": str(args.json_output),
+            "checkpoint": str(args.checkpoint),
+            "chunk_size": args.chunk_size,
+            "chunk_dir": str(args.chunk_dir),
+            "chunk_manifest": str(args.chunk_manifest),
+        },
+        "config": config_metadata,
+        "prompt_source": prompt_source,
+    }
+    if dataset_profile is not None:
+        payload["dataset_profile"] = dataset_profile
+
+    run_metadata_file = Path(args.run_metadata_file)
+    run_metadata_file.parent.mkdir(parents=True, exist_ok=True)
+    with run_metadata_file.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
 
 
 def calculate_energy_cost(
@@ -921,7 +1277,7 @@ def rebuild_manifest(chunk_dir: Path, manifest_path: Path) -> None:
         if csv_path.exists():
             print(f"Counting total rows in {csv_path}...")
             try:
-                total_dataset_rows = count_total_csv_rows(csv_path)
+                total_dataset_rows = count_total_rows(csv_path)
                 print(f"Found {total_dataset_rows:,} total rows in dataset")
                 break
             except Exception as e:
@@ -957,6 +1313,79 @@ def rebuild_manifest(chunk_dir: Path, manifest_path: Path) -> None:
     print(f"Manifest written to: {manifest_path}")
 
 
+def build_output_records(
+    *,
+    idx: int,
+    source_row: Dict[str, str],
+    result: Dict[str, Any],
+    args: argparse.Namespace,
+    config_metadata: Dict[str, Any],
+    quality: Dict[str, Any],
+    processing_status: str,
+    skip_reason: str,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    source_pdf_url = derive_justice_pdf_url(
+        source_row.get("filename", ""), base_url=args.justice_files_base_url
+    )
+    key_insights = normalize_text_list(ensure_list(result.get("key_insights")))
+    tags = normalize_text_list(ensure_list(result.get("tags")))
+    power_mentions = normalize_text_list(
+        ensure_list(result.get("power_mentions")), strip_descriptor=True
+    )
+    agency_involvement = normalize_agencies(
+        normalize_text_list(ensure_list(result.get("agency_involvement")), strip_descriptor=True)
+    )
+    lead_types = normalize_lead_types(ensure_list(result.get("lead_types")))
+    action_items = (
+        normalize_text_list(ensure_list(result.get("action_items")))
+        if args.include_action_items
+        else []
+    )
+
+    csv_row = {
+        "filename": source_row["filename"],
+        "source_row_index": idx,
+        "source_pdf_url": source_pdf_url or "",
+        "processing_status": processing_status,
+        "skip_reason": skip_reason,
+        "headline": result.get("headline", ""),
+        "importance_score": result.get("importance_score", ""),
+        "reason": result.get("reason", ""),
+        "key_insights": "; ".join(key_insights),
+        "tags": "; ".join(tags),
+        "power_mentions": "; ".join(power_mentions),
+        "agency_involvement": "; ".join(agency_involvement),
+        "lead_types": "; ".join(lead_types),
+    }
+    if args.include_action_items:
+        csv_row["action_items"] = "; ".join(action_items)
+
+    json_record: Dict[str, Any] = {
+        "filename": source_row["filename"],
+        "source_pdf_url": source_pdf_url,
+        "headline": result.get("headline", ""),
+        "importance_score": result.get("importance_score", ""),
+        "reason": result.get("reason", ""),
+        "key_insights": key_insights,
+        "tags": tags,
+        "power_mentions": power_mentions,
+        "agency_involvement": agency_involvement,
+        "lead_types": lead_types,
+        "metadata": {
+            "source_row_index": idx,
+            "original_row": source_row,
+            "config": config_metadata,
+            "source_pdf_url": source_pdf_url,
+            "processing_status": processing_status,
+            "skip_reason": skip_reason,
+            "text_quality": quality,
+        },
+    }
+    if args.include_action_items:
+        json_record["action_items"] = action_items
+    return csv_row, json_record
+
+
 def main() -> None:
     args = parse_args()
     if args.list_models:
@@ -971,7 +1400,21 @@ def main() -> None:
     system_prompt, prompt_source = load_system_prompt(args)
 
     if not args.input.exists():
-        sys.exit(f"Input CSV not found: {args.input}")
+        sys.exit(f"Input path not found: {args.input}")
+    if args.dataset_metadata_file and not args.dataset_metadata_file.exists():
+        sys.exit(f"Dataset metadata file not found: {args.dataset_metadata_file}")
+    if args.max_parallel_requests < 1:
+        sys.exit("--max-parallel-requests must be >= 1")
+    if args.min_text_chars < 0:
+        sys.exit("--min-text-chars must be >= 0")
+    if args.min_text_words < 0:
+        sys.exit("--min-text-words must be >= 0")
+    if args.min_alpha_ratio < 0:
+        sys.exit("--min-alpha-ratio must be >= 0")
+    if args.min_unique_word_ratio < 0:
+        sys.exit("--min-unique-word-ratio must be >= 0")
+    if args.max_repeated_char_run < 1:
+        sys.exit("--max-repeated-char-run must be >= 1")
     if args.start_row < 1:
         sys.exit("--start-row must be >= 1")
     if args.end_row is not None and args.end_row < args.start_row:
@@ -1004,6 +1447,9 @@ def main() -> None:
     fieldnames = [
         "filename",
         "source_row_index",
+        "source_pdf_url",
+        "processing_status",
+        "skip_reason",
         "headline",
         "importance_score",
         "reason",
@@ -1028,6 +1474,7 @@ def main() -> None:
 
     workload_stats = calculate_workload(
         args.input,
+        input_glob=args.input_glob,
         max_rows=args.max_rows,
         completed_filenames=completed_filenames if args.resume else set(),
         start_row=args.start_row,
@@ -1046,12 +1493,17 @@ def main() -> None:
     )
 
     output_router = OutputRouter(args, fieldnames)
+    total_dataset_rows: Optional[int] = None
 
     # Count total rows in dataset for manifest metadata
     if output_router.mode == "chunk":
         print("Counting total rows in dataset...")
-        output_router.total_dataset_rows = count_total_csv_rows(args.input)
+        output_router.total_dataset_rows = count_total_rows(args.input, input_glob=args.input_glob)
+        total_dataset_rows = output_router.total_dataset_rows
         print(f"Total dataset: {output_router.total_dataset_rows:,} rows")
+    elif args.run_metadata_file:
+        # Single-file mode still records total row count in run metadata.
+        total_dataset_rows = count_total_rows(args.input, input_glob=args.input_glob)
 
     checkpoint_handle = (
         args.checkpoint.open("a", encoding="utf-8") if args.checkpoint else None
@@ -1059,15 +1511,112 @@ def main() -> None:
 
     # Build config metadata to include in requests and outputs
     config_metadata = build_config_metadata(args, prompt_source)
+    try:
+        dataset_profile = load_dataset_profile(args.dataset_metadata_file)
+    except (FileNotFoundError, ValueError, json.JSONDecodeError) as exc:
+        sys.exit(str(exc))
+    write_run_metadata(
+        args=args,
+        prompt_source=prompt_source,
+        config_metadata=config_metadata,
+        workload_stats=workload_stats,
+        total_dataset_rows=total_dataset_rows,
+        dataset_profile=dataset_profile,
+    )
 
     start_time = time.monotonic()
+    emit_order: Deque[int] = deque()
+    pending_results: Dict[int, Dict[str, Any]] = {}
+    in_flight: Dict[concurrent.futures.Future[Dict[str, Any]], Dict[str, Any]] = {}
+    scheduled = 0
+    skipped = 0
+    failed = 0
+    model_scored = 0
+    executor = (
+        concurrent.futures.ThreadPoolExecutor(max_workers=args.max_parallel_requests)
+        if args.max_parallel_requests > 1
+        else None
+    )
+
+    def flush_ready() -> None:
+        nonlocal processed, skipped, failed, model_scored
+        while emit_order and emit_order[0] in pending_results:
+            row_idx = emit_order.popleft()
+            outcome = pending_results.pop(row_idx)
+            if outcome["type"] == "error":
+                failed += 1
+                print(
+                    f"  ! Failed to analyze {outcome['row']['filename']}: {outcome['error']}",
+                    file=sys.stderr,
+                )
+                continue
+
+            csv_row, json_record = build_output_records(
+                idx=row_idx,
+                source_row=outcome["row"],
+                result=outcome["result"],
+                args=args,
+                config_metadata=config_metadata,
+                quality=outcome["quality"],
+                processing_status=outcome["processing_status"],
+                skip_reason=outcome["skip_reason"],
+            )
+            output_router.write(row_idx, csv_row, json_record)
+
+            filename = outcome["row"]["filename"]
+            if checkpoint_handle:
+                checkpoint_handle.write(filename + "\n")
+                checkpoint_handle.flush()
+            completed_filenames.add(filename)
+            processed += 1
+            if outcome["processing_status"] == "skipped":
+                skipped += 1
+            else:
+                model_scored += 1
+
+    def harvest_completed(*, block: bool) -> None:
+        if not in_flight:
+            return
+        timeout = None if block else 0
+        done, _ = concurrent.futures.wait(
+            set(in_flight.keys()),
+            timeout=timeout,
+            return_when=concurrent.futures.FIRST_COMPLETED,
+        )
+        if not done:
+            return
+        for future in done:
+            context = in_flight.pop(future)
+            row_idx = context["idx"]
+            row = context["row"]
+            quality = context["quality"]
+            try:
+                result = future.result()
+                pending_results[row_idx] = {
+                    "type": "record",
+                    "row": row,
+                    "result": result,
+                    "quality": quality,
+                    "processing_status": "processed",
+                    "skip_reason": "",
+                }
+            except Exception as exc:  # noqa: BLE001
+                pending_results[row_idx] = {
+                    "type": "error",
+                    "row": row,
+                    "error": str(exc),
+                }
+        flush_ready()
+
     try:
-        for idx, row in enumerate(iter_rows(args.input), start=1):
+        for idx, row in enumerate(
+            iter_rows(args.input, input_glob=args.input_glob, include_text=True), start=1
+        ):
             if idx < args.start_row:
                 continue
             if args.end_row is not None and idx > args.end_row:
                 break
-            if args.max_rows is not None and processed >= args.max_rows:
+            if args.max_rows is not None and scheduled >= args.max_rows:
                 break
 
             filename = row["filename"]
@@ -1075,6 +1624,24 @@ def main() -> None:
 
             if filename in completed_filenames:
                 print(f"[Row {idx}] [skip] {filename} already processed.", flush=True)
+                continue
+
+            scheduled += 1
+            emit_order.append(idx)
+
+            quality = assess_text_quality(text)
+            skip_reason = build_skip_reason(quality, args) if args.skip_low_quality else None
+            if skip_reason:
+                print(f"[Row {idx}] [skip] {filename}: {skip_reason}", flush=True)
+                pending_results[idx] = {
+                    "type": "record",
+                    "row": row,
+                    "result": build_skipped_model_result(skip_reason),
+                    "quality": quality,
+                    "processing_status": "skipped",
+                    "skip_reason": skip_reason,
+                }
+                flush_ready()
                 continue
 
             # Show both source row index and processing progress
@@ -1092,8 +1659,42 @@ def main() -> None:
             )
             print(f"{progress_prefix} Processing {filename}... {eta_text}", flush=True)
 
-            try:
-                result = call_model(
+            request_kwargs = {
+                "endpoint": args.endpoint,
+                "model": args.model,
+                "filename": filename,
+                "text": text,
+                "system_prompt": system_prompt,
+                "api_key": args.api_key,
+                "timeout": args.timeout,
+                "temperature": args.temperature,
+                "reasoning_effort": args.reasoning_effort,
+                "config_metadata": config_metadata,
+            }
+
+            if executor is None:
+                try:
+                    result = call_model(**request_kwargs)
+                    pending_results[idx] = {
+                        "type": "record",
+                        "row": row,
+                        "result": result,
+                        "quality": quality,
+                        "processing_status": "processed",
+                        "skip_reason": "",
+                    }
+                except Exception as exc:  # noqa: BLE001
+                    pending_results[idx] = {
+                        "type": "error",
+                        "row": row,
+                        "error": str(exc),
+                    }
+                flush_ready()
+            else:
+                while len(in_flight) >= args.max_parallel_requests:
+                    harvest_completed(block=True)
+                future = executor.submit(
+                    call_model,
                     endpoint=args.endpoint,
                     model=args.model,
                     filename=filename,
@@ -1105,70 +1706,19 @@ def main() -> None:
                     reasoning_effort=args.reasoning_effort,
                     config_metadata=config_metadata,
                 )
-            except Exception as exc:  # noqa: BLE001
-                print(f"  ! Failed to analyze {filename}: {exc}", file=sys.stderr)
-                continue
+                in_flight[future] = {"idx": idx, "row": row, "quality": quality}
+                harvest_completed(block=False)
 
-            key_insights = normalize_text_list(ensure_list(result.get("key_insights")))
-            tags = normalize_text_list(ensure_list(result.get("tags")))
-            power_mentions = normalize_text_list(
-                ensure_list(result.get("power_mentions")), strip_descriptor=True
-            )
-            agency_involvement = normalize_agencies(
-                normalize_text_list(ensure_list(result.get("agency_involvement")), strip_descriptor=True)
-            )
-            lead_types = normalize_lead_types(ensure_list(result.get("lead_types")))
-            action_items = (
-                normalize_text_list(ensure_list(result.get("action_items")))
-                if args.include_action_items
-                else []
-            )
-
-            csv_row = {
-                "filename": filename,
-                "source_row_index": idx,
-                "headline": result.get("headline", ""),
-                "importance_score": result.get("importance_score", ""),
-                "reason": result.get("reason", ""),
-                "key_insights": "; ".join(key_insights),
-                "tags": "; ".join(tags),
-                "power_mentions": "; ".join(power_mentions),
-                "agency_involvement": "; ".join(agency_involvement),
-                "lead_types": "; ".join(lead_types),
-            }
-            if args.include_action_items:
-                csv_row["action_items"] = "; ".join(action_items)
-
-            json_record: Dict[str, Any] = {
-                "filename": filename,
-                "headline": result.get("headline", ""),
-                "importance_score": result.get("importance_score", ""),
-                "reason": result.get("reason", ""),
-                "key_insights": key_insights,
-                "tags": tags,
-                "power_mentions": power_mentions,
-                "agency_involvement": agency_involvement,
-                "lead_types": lead_types,
-                "metadata": {
-                    "source_row_index": idx,
-                    "original_row": row,
-                    "config": config_metadata,
-                },
-            }
-            if args.include_action_items:
-                json_record["action_items"] = action_items
-
-            output_router.write(idx, csv_row, json_record)
-
-            if checkpoint_handle:
-                checkpoint_handle.write(filename + "\n")
-                checkpoint_handle.flush()
-
-            completed_filenames.add(filename)
-            processed += 1
             if args.sleep:
                 time.sleep(args.sleep)
+
+        while in_flight:
+            harvest_completed(block=True)
+
+        flush_ready()
     finally:
+        if executor:
+            executor.shutdown(wait=True)
         if checkpoint_handle:
             checkpoint_handle.close()
         output_router.close()
@@ -1178,12 +1728,14 @@ def main() -> None:
     cost_summary = format_cost_summary(args.power_watts, args.electric_rate, elapsed_hours, args.run_hours)
     if args.chunk_size > 0:
         complete_msg = (
-            f"Completed {processed} new rows in {format_duration(elapsed)}. "
+            f"Completed {processed} new rows in {format_duration(elapsed)} "
+            f"({model_scored} modeled, {skipped} skipped, {failed} failed). "
             f"Chunks saved under {args.chunk_dir} | manifest: {args.chunk_manifest}"
         )
     else:
         complete_msg = (
-            f"Completed {processed} new rows in {format_duration(elapsed)}. "
+            f"Completed {processed} new rows in {format_duration(elapsed)} "
+            f"({model_scored} modeled, {skipped} skipped, {failed} failed). "
             f"CSV saved to {args.output} | JSONL appended to {args.json_output}"
         )
     if cost_summary:

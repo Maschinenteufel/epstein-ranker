@@ -1,0 +1,85 @@
+{
+  "profile_id": "standardworks_epstein_files",
+  "source_label": "StandardWorks Epstein Files",
+  "source_url": "https://standardworks.ai/epstein-files",
+  "captured_on": "2026-02-16",
+  "notes": [
+    "Treat as an independent corpus from the House Oversight dataset.",
+    "Document/title overlap may exist, but this profile assumes distinct processing outputs."
+  ],
+  "datasets": [
+    {
+      "name": "Data Set 1",
+      "documents": 3112,
+      "pages": 3112,
+      "size_mb": 0.1
+    },
+    {
+      "name": "Data Set 2",
+      "documents": 576,
+      "pages": 700,
+      "size_mb": 0.1
+    },
+    {
+      "name": "Data Set 3",
+      "documents": 68,
+      "pages": 1847,
+      "size_mb": 0.3
+    },
+    {
+      "name": "Data Set 4",
+      "documents": 153,
+      "pages": 2705,
+      "size_mb": 3.0
+    },
+    {
+      "name": "Data Set 5",
+      "documents": 121,
+      "pages": 121,
+      "size_mb": 0.1
+    },
+    {
+      "name": "Data Set 6",
+      "documents": 14,
+      "pages": 487,
+      "size_mb": 0.4
+    },
+    {
+      "name": "Data Set 7",
+      "documents": 18,
+      "pages": 661,
+      "size_mb": 0.7
+    },
+    {
+      "name": "Data Set 8",
+      "documents": 11031,
+      "pages": 27302,
+      "size_mb": 35.4
+    },
+    {
+      "name": "Data Set 9",
+      "status": "still processing",
+      "documents": 104719,
+      "pages": 336395,
+      "size_mb": 412.1
+    },
+    {
+      "name": "Data Set 10",
+      "documents": 503099,
+      "pages": 898310,
+      "size_mb": 825.9
+    },
+    {
+      "name": "Data Set 11",
+      "documents": 331640,
+      "pages": 515310,
+      "size_mb": 467.6
+    },
+    {
+      "name": "Data Set 12",
+      "documents": 153,
+      "pages": 1526,
+      "size_mb": 1.5
+    }
+  ]
+}

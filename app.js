@@ -1,8 +1,33 @@
 import { POWER_ALIASES } from "./power_aliases.js";
 
-const DATA_URL = "/data/epstein_ranked.jsonl";
-const CHUNK_MANIFEST_URL = "/data/chunks.json";
 const DEFAULT_CHUNK_SIZE = 1000;
+const DATASET_STORAGE_KEY = "epstein_viewer_dataset";
+const DATASETS = {
+  oversight: {
+    key: "oversight",
+    label: "Oversight Committee",
+    title: "U.S. House Oversight Epstein Estate Documents",
+    subtitle:
+      "AI-ranked analysis of 20,000+ pages released by the House Oversight Committee. These are the estate documents already made public—not the unreleased files still pending disclosure.",
+    estimateLabel: "of ~25,800 documents.",
+    manifestUrl: "/data/chunks.json",
+    dataUrl: "/data/epstein_ranked.jsonl",
+    fallbackChunkPrefix: "/contrib",
+    fallbackChunkSize: 1000,
+  },
+  doj_fta: {
+    key: "doj_fta",
+    label: "DOJ File Transparency Act",
+    title: "DOJ Epstein Files (File Transparency Act)",
+    subtitle:
+      "AI-ranked analysis of the DOJ File Transparency Act corpus. This dataset is processed independently from the House Oversight corpus.",
+    estimateLabel: "of ~954,704+ documents.",
+    manifestUrl: "/data/workspaces/standardworks_epstein_files/metadata/chunks.json",
+    dataUrl: "/data/workspaces/standardworks_epstein_files/results/epstein_ranked.jsonl",
+    fallbackChunkPrefix: "/data/workspaces/standardworks_epstein_files/chunks",
+    fallbackChunkSize: 1000,
+  },
+};
 const POWER_ALIAS_MAP = {
   "barack obama": ["barack obama", "obama", "barack", "president obama"],
   "donald trump": ["donald trump", "trump", "donald j trump", "president trump"],
@@ -15,6 +40,12 @@ const POWER_ALIAS_MAP = {
 };
 
 const elements = {
+  datasetSelector: document.getElementById("datasetSelector"),
+  datasetTitle: document.getElementById("datasetTitle"),
+  datasetSubtitle: document.getElementById("datasetSubtitle"),
+  processingLabel: document.getElementById("processingLabel"),
+  processingIntro: document.getElementById("processingIntro"),
+  datasetEstimate: document.getElementById("datasetEstimate"),
   scoreFilter: document.getElementById("scoreFilter"),
   scoreValue: document.getElementById("scoreValue"),
   leadFilter: document.getElementById("leadTypeFilter"),
@@ -35,6 +66,7 @@ const elements = {
   detailAgencies: document.getElementById("detailAgencies"),
   detailTags: document.getElementById("detailTags"),
   detailModel: document.getElementById("detailModel"),
+  detailSourceUrl: document.getElementById("detailSourceUrl"),
   detailText: document.getElementById("detailText"),
   detailTextPreview: document.getElementById("detailTextPreview"),
   detailTextToggle: document.getElementById("detailTextToggle"),
@@ -68,12 +100,54 @@ const state = {
   activeRowId: null,
   powerDisplayNames: {},
   filtersEnabled: false,
+  activeDatasetKey: "oversight",
 };
 
 const powerAliasLookup = buildPowerAliasLookup(POWER_ALIASES);
 const canonicalPowerList = buildCanonicalPowerList(powerAliasLookup);
 const powerKeywordMap = buildPowerKeywordMap(POWER_ALIASES, powerAliasLookup);
 const canonicalAliasKeyMap = buildCanonicalAliasKeyMap(POWER_ALIASES);
+
+function getActiveDataset() {
+  return DATASETS[state.activeDatasetKey] || DATASETS.oversight;
+}
+
+function updateDatasetCopy() {
+  const dataset = getActiveDataset();
+  document.title = `${dataset.title} - Intelligence Briefing`;
+  if (elements.datasetTitle) {
+    elements.datasetTitle.textContent = dataset.title;
+  }
+  if (elements.datasetSubtitle) {
+    elements.datasetSubtitle.textContent = dataset.subtitle;
+  }
+  if (elements.processingLabel) {
+    elements.processingLabel.textContent = "Note:";
+  }
+  if (elements.processingIntro) {
+    elements.processingIntro.textContent =
+      "We are still processing the remaining files. Currently showing";
+  }
+  if (elements.datasetEstimate) {
+    elements.datasetEstimate.textContent = dataset.estimateLabel;
+  }
+  if (elements.datasetSelector) {
+    elements.datasetSelector.value = dataset.key;
+  }
+}
+
+function resetDatasetState() {
+  state.raw = [];
+  state.filtered = [];
+  state.lastUpdated = null;
+  state.manifestMetadata = null;
+  state.activeRowId = null;
+  if (state.gridOptions?.api) {
+    state.gridOptions.api.setRowData([]);
+  }
+  updateSummary();
+  clearDetail();
+}
 
 function resetLoadingState(title = "Loading Epstein Files…", subtitle = "Preparing data") {
   state.powerDisplayNames = {};
@@ -484,6 +558,17 @@ function findCanonicalByToken(key) {
   return null;
 }
 
+function deriveJusticePdfUrl(filename) {
+  if (!filename) return null;
+  const datasetMatch = String(filename).match(/DataSet\\s*0*(\\d+)/i);
+  const eftaMatch = String(filename).match(/(EFTA\\d{8})/i);
+  if (!datasetMatch || !eftaMatch) return null;
+  const datasetNumber = Number.parseInt(datasetMatch[1], 10);
+  if (!Number.isFinite(datasetNumber) || datasetNumber < 1) return null;
+  const eftaId = eftaMatch[1].toUpperCase();
+  return `https://www.justice.gov/epstein/files/DataSet%20${datasetNumber}/${eftaId}.pdf`;
+}
+
 function normalizeRow(row) {
   const importance = Number(row.importance_score ?? 0);
   const arrays = (value) => (Array.isArray(value) ? value : []);
@@ -504,6 +589,10 @@ function normalizeRow(row) {
     agency_involvement: arrays(row.agency_involvement),
     lead_types: arrays(row.lead_types),
     metadata: row.metadata || {},
+    source_pdf_url:
+      row.source_pdf_url ||
+      row.metadata?.source_pdf_url ||
+      deriveJusticePdfUrl(row.filename || row.metadata?.original_row?.filename || ""),
     original_text: row.metadata?.original_row?.text || "",
   };
   normalized.search_blob = [
@@ -946,22 +1035,29 @@ function updateAgencyChart() {
 }
 
 async function loadData() {
+  const dataset = getActiveDataset();
   const loadId = Date.now();
   state.currentLoadId = loadId;
-  resetLoadingState("Loading Epstein Files…", "Fetching chunk manifest");
+  resetDatasetState();
+  resetLoadingState(`Loading ${dataset.label}…`, "Fetching chunk manifest");
   try {
-    const manifest = await fetchManifest();
+    const manifest = await fetchManifest(dataset.manifestUrl);
     if (manifest && manifest.chunks && manifest.chunks.length > 0) {
       await loadChunks(manifest, loadId);
       finishInitialLoadingUI();
       return;
     }
   } catch (err) {
-    console.warn("Chunk manifest unavailable, falling back to epstein_ranked.jsonl.", err);
+    console.warn(`Chunk manifest unavailable for ${dataset.label}, falling back to JSONL.`, err);
   }
 
   try {
-    await loadSequentialChunks(DEFAULT_CHUNK_SIZE, 500, loadId);
+    await loadSequentialChunks(
+      dataset.fallbackChunkSize || DEFAULT_CHUNK_SIZE,
+      500,
+      loadId,
+      dataset.fallbackChunkPrefix
+    );
     finishInitialLoadingUI();
     setFiltersEnabled(true, { triggerApply: true });
     return;
@@ -970,7 +1066,7 @@ async function loadData() {
   }
 
   try {
-    await loadSingleFile(loadId);
+    await loadSingleFile(loadId, dataset.dataUrl);
     finishInitialLoadingUI();
     setFiltersEnabled(true, { triggerApply: true });
   } catch (error) {
@@ -978,14 +1074,14 @@ async function loadData() {
     finishInitialLoadingUI();
     hideInlineLoader();
     alert(
-      "Unable to load ranked outputs. Ensure contrib/epstein_ranked_*.jsonl files or data/epstein_ranked.jsonl exist."
+      `Unable to load ranked outputs for ${dataset.label}. Ensure chunk files under ${dataset.fallbackChunkPrefix}/epstein_ranked_*.jsonl or ${dataset.dataUrl} exist.`
     );
   }
 }
 
-async function fetchManifest() {
+async function fetchManifest(manifestUrl) {
   try {
-    const response = await fetch(`${CHUNK_MANIFEST_URL}?t=${Date.now()}`);
+    const response = await fetch(`${manifestUrl}?t=${Date.now()}`);
     if (!response.ok) {
       return null;
     }
@@ -1090,7 +1186,12 @@ async function backgroundLoadChunks(chunks, loadId, concurrency = 8) {
   }
 }
 
-async function loadSequentialChunks(chunkSize = DEFAULT_CHUNK_SIZE, maxChunks = 500, loadId = state.currentLoadId) {
+async function loadSequentialChunks(
+  chunkSize = DEFAULT_CHUNK_SIZE,
+  maxChunks = 500,
+  loadId = state.currentLoadId,
+  chunkPrefix = "/contrib"
+) {
   const rows = [];
   let start = 1;
   let attempts = 0;
@@ -1103,7 +1204,7 @@ async function loadSequentialChunks(chunkSize = DEFAULT_CHUNK_SIZE, maxChunks = 
       return;
     }
     const end = start + chunkSize - 1;
-    const path = `/contrib/epstein_ranked_${String(start).padStart(5, "0")}_${String(
+    const path = `${chunkPrefix}/epstein_ranked_${String(start).padStart(5, "0")}_${String(
       end
     ).padStart(5, "0")}.jsonl`;
     attempts += 1;
@@ -1137,8 +1238,8 @@ async function loadSequentialChunks(chunkSize = DEFAULT_CHUNK_SIZE, maxChunks = 
   await hydrateRows(rows, { append: false });
 }
 
-async function loadSingleFile(loadId = state.currentLoadId) {
-  const response = await fetch(`${DATA_URL}?t=${Date.now()}`);
+async function loadSingleFile(loadId = state.currentLoadId, dataUrl = "/data/epstein_ranked.jsonl") {
+  const response = await fetch(`${dataUrl}?t=${Date.now()}`);
   if (!response.ok) {
     throw new Error(`Failed to fetch data: ${response.status}`);
   }
@@ -1207,6 +1308,39 @@ function resetFilters() {
   applyFilters({ force: true });
 }
 
+async function switchDataset(nextKey) {
+  if (!DATASETS[nextKey] || state.activeDatasetKey === nextKey) {
+    return;
+  }
+  state.activeDatasetKey = nextKey;
+  window.localStorage.setItem(DATASET_STORAGE_KEY, nextKey);
+  updateDatasetCopy();
+  resetFilters();
+  await loadData();
+}
+
+function initDatasetSelector() {
+  if (!elements.datasetSelector) {
+    return;
+  }
+  const options = Object.values(DATASETS).map(
+    (dataset) => `<option value="${dataset.key}">${dataset.label}</option>`
+  );
+  elements.datasetSelector.innerHTML = options.join("");
+
+  const stored = window.localStorage.getItem(DATASET_STORAGE_KEY);
+  const preferred = DATASETS[stored] ? stored : "oversight";
+  state.activeDatasetKey = preferred;
+  updateDatasetCopy();
+
+  elements.datasetSelector.addEventListener("change", (event) => {
+    const nextKey = event.target.value;
+    switchDataset(nextKey).catch((err) => {
+      console.error("Failed to switch dataset", err);
+    });
+  });
+}
+
 function wireEvents() {
   ["change", "input"].forEach((eventName) => {
     elements.scoreFilter.addEventListener(eventName, applyFilters);
@@ -1246,6 +1380,7 @@ function debounce(fn, delay) {
 document.addEventListener("DOMContentLoaded", () => {
   initGrid();
   initChoices();
+  initDatasetSelector();
   wireEvents();
   loadData();
 });
@@ -1454,6 +1589,13 @@ function renderDetail(row, options = {}) {
   // Display model if available in metadata
   const model = row.metadata?.config?.model || "—";
   elements.detailModel.textContent = model;
+  if (row.source_pdf_url) {
+    elements.detailSourceUrl.textContent = "Open source PDF";
+    elements.detailSourceUrl.href = row.source_pdf_url;
+  } else {
+    elements.detailSourceUrl.textContent = "—";
+    elements.detailSourceUrl.removeAttribute("href");
+  }
 
   // Handle original text with collapse/expand
   const originalText = row.original_text || "No source text captured.";
@@ -1494,6 +1636,8 @@ function clearDetail() {
   elements.detailAgencies.innerHTML = "—";
   elements.detailTags.innerHTML = "—";
   elements.detailModel.textContent = "—";
+  elements.detailSourceUrl.textContent = "—";
+  elements.detailSourceUrl.removeAttribute("href");
   elements.detailText.innerHTML = "—";
   elements.detailTextPreview.innerHTML = "—";
   elements.detailText.classList.add("hidden");

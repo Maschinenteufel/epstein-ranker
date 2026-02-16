@@ -1,0 +1,209 @@
+import argparse
+import csv
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+import gpt_ranker
+
+
+class GptRankerHelpersTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.skip_args = argparse.Namespace(
+            min_text_chars=60,
+            min_text_words=12,
+            min_alpha_ratio=0.25,
+            min_unique_word_ratio=0.15,
+            max_repeated_char_run=40,
+            include_action_items=False,
+            justice_files_base_url=gpt_ranker.DEFAULT_JUSTICE_FILES_BASE_URL,
+        )
+
+    def test_iter_rows_supports_directory_input(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            nested = root / "a" / "b"
+            nested.mkdir(parents=True)
+            (nested / "first.txt").write_text("hello world", encoding="utf-8")
+            (root / "second.txt").write_text("another file", encoding="utf-8")
+            (root / "ignore.md").write_text("should not load", encoding="utf-8")
+
+            rows = list(gpt_ranker.iter_rows(root, input_glob="*.txt", include_text=True))
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["filename"], "a/b/first.txt")
+        self.assertEqual(rows[1]["filename"], "second.txt")
+        self.assertEqual(rows[0]["text"], "hello world")
+
+    def test_iter_rows_supports_csv_input(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            csv_path = Path(tmpdir) / "data.csv"
+            with csv_path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=["filename", "text"])
+                writer.writeheader()
+                writer.writerow({"filename": "one.txt", "text": "hello"})
+                writer.writerow({"filename": "two.txt", "text": "world"})
+
+            rows = list(gpt_ranker.iter_rows(csv_path))
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["filename"], "one.txt")
+        self.assertEqual(rows[1]["text"], "world")
+
+    def test_skip_reason_flags_low_quality_rows(self) -> None:
+        quality = gpt_ranker.assess_text_quality("x")
+        reason = gpt_ranker.build_skip_reason(quality, self.skip_args)
+        self.assertIsNotNone(reason)
+        self.assertIn("too short", reason)
+
+    def test_skip_reason_allows_normal_text(self) -> None:
+        text = (
+            "This is a normal paragraph with enough words to pass screening and "
+            "contains meaningful language for downstream analysis."
+        )
+        quality = gpt_ranker.assess_text_quality(text)
+        reason = gpt_ranker.build_skip_reason(quality, self.skip_args)
+        self.assertIsNone(reason)
+
+    def test_build_output_records_marks_skipped_status(self) -> None:
+        source_row = {"filename": "sample.txt", "text": ""}
+        quality = gpt_ranker.assess_text_quality("")
+        result = gpt_ranker.build_skipped_model_result("empty text")
+        csv_row, json_record = gpt_ranker.build_output_records(
+            idx=3,
+            source_row=source_row,
+            result=result,
+            args=self.skip_args,
+            config_metadata={"model": "qwen/qwen3-coder-next"},
+            quality=quality,
+            processing_status="skipped",
+            skip_reason="empty text",
+        )
+
+        self.assertEqual(csv_row["processing_status"], "skipped")
+        self.assertEqual(csv_row["skip_reason"], "empty text")
+        self.assertEqual(csv_row["importance_score"], 0)
+        self.assertEqual(json_record["metadata"]["processing_status"], "skipped")
+        self.assertEqual(json_record["metadata"]["skip_reason"], "empty text")
+        self.assertEqual(csv_row["source_pdf_url"], "")
+
+    def test_derive_justice_pdf_url_from_dataset_path(self) -> None:
+        filename = "DataSet10/IMAGES/0332/EFTA01970985.txt"
+        url = gpt_ranker.derive_justice_pdf_url(filename)
+        self.assertEqual(
+            url,
+            "https://www.justice.gov/epstein/files/DataSet%2010/EFTA01970985.pdf",
+        )
+
+    def test_derive_justice_pdf_url_returns_none_when_unmatched(self) -> None:
+        self.assertIsNone(gpt_ranker.derive_justice_pdf_url("notes/no_match.txt"))
+
+    def test_cli_explicit_default_value_overrides_config(self) -> None:
+        original_argv = sys.argv[:]
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                config_path = Path(tmpdir) / "ranker_config.toml"
+                config_path.write_text("sleep = 0.5\n", encoding="utf-8")
+                sys.argv = [
+                    "gpt_ranker.py",
+                    "--config",
+                    str(config_path),
+                    "--sleep",
+                    "0",
+                ]
+                args = gpt_ranker.parse_args()
+                self.assertEqual(args.sleep, 0.0)
+        finally:
+            sys.argv = original_argv
+
+    def test_apply_dataset_workspace_defaults_sets_isolated_paths(self) -> None:
+        args = argparse.Namespace(
+            dataset_workspace_root=Path("data/workspaces"),
+            dataset_tag=None,
+            input=Path("data/new_data"),
+            output=Path("data/epstein_ranked.csv"),
+            json_output=Path("data/epstein_ranked.jsonl"),
+            checkpoint=Path("data/.epstein_checkpoint"),
+            chunk_dir=Path("contrib"),
+            chunk_manifest=Path("data/chunks.json"),
+            run_metadata_file=None,
+            known_json=["old.jsonl"],
+        )
+        gpt_ranker.apply_dataset_workspace_defaults(args, cli_explicit=set())
+
+        self.assertEqual(args.dataset_tag, "new_data")
+        self.assertEqual(
+            args.output,
+            Path("data/workspaces/new_data/results/epstein_ranked.csv"),
+        )
+        self.assertEqual(
+            args.chunk_manifest,
+            Path("data/workspaces/new_data/metadata/chunks.json"),
+        )
+        self.assertEqual(args.known_json, [])
+
+    def test_apply_dataset_workspace_defaults_keeps_explicit_paths(self) -> None:
+        args = argparse.Namespace(
+            dataset_workspace_root=Path("data/workspaces"),
+            dataset_tag="custom",
+            input=Path("data/new_data"),
+            output=Path("/tmp/custom.csv"),
+            json_output=Path("/tmp/custom.jsonl"),
+            checkpoint=Path("/tmp/custom.ckpt"),
+            chunk_dir=Path("/tmp/chunks"),
+            chunk_manifest=Path("/tmp/chunks.json"),
+            run_metadata_file=Path("/tmp/run_meta.json"),
+            known_json=["keep.jsonl"],
+        )
+        gpt_ranker.apply_dataset_workspace_defaults(
+            args,
+            cli_explicit={
+                "output",
+                "json_output",
+                "checkpoint",
+                "chunk_dir",
+                "chunk_manifest",
+                "run_metadata_file",
+                "known_json",
+            },
+        )
+
+        self.assertEqual(args.dataset_tag, "custom")
+        self.assertEqual(args.output, Path("/tmp/custom.csv"))
+        self.assertEqual(args.chunk_dir, Path("/tmp/chunks"))
+        self.assertEqual(args.known_json, ["keep.jsonl"])
+
+    def test_write_run_metadata_writes_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_file = Path(tmpdir) / "meta" / "run.json"
+            args = argparse.Namespace(
+                run_metadata_file=run_file,
+                dataset_tag="standardworks_epstein_files",
+                dataset_source_label="StandardWorks",
+                dataset_source_url="https://standardworks.ai/epstein-files",
+                input=Path("data/new_data"),
+                input_glob="*.txt",
+                output=Path("out.csv"),
+                json_output=Path("out.jsonl"),
+                checkpoint=Path("ckpt"),
+                chunk_size=1000,
+                chunk_dir=Path("chunks"),
+                chunk_manifest=Path("chunks.json"),
+            )
+            gpt_ranker.write_run_metadata(
+                args=args,
+                prompt_source="prompts/default_system_prompt.txt",
+                config_metadata={"model": "qwen/qwen3-coder-next"},
+                workload_stats={"total": 10, "already_done": 0, "workload": 10},
+                total_dataset_rows=10,
+                dataset_profile={"profile_id": "standardworks_epstein_files"},
+            )
+
+            payload = run_file.read_text(encoding="utf-8")
+            self.assertIn("standardworks_epstein_files", payload)
+            self.assertIn("dataset_profile", payload)
+
+
+if __name__ == "__main__":
+    unittest.main()

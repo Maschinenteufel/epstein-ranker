@@ -5,7 +5,7 @@
 LLM-powered tooling for triaging the **U.S. House Oversight Epstein Estate** document release.
 This project:
 
-1. Streams the document corpus through a locally hosted, open-source model (`openai/gpt-oss-120b` running via **LM Studio**) to produce ranked, structured leads.
+1. Streams the document corpus through a locally hosted, open-source model (`qwen/qwen3-coder-next` running via **LM Studio**) to produce ranked, structured leads.
 2. Ships a dashboard (`viewer/`) so investigators can filter, chart, and inspect every scored document (including the full source text) offline.
 
 The entire workflow operates on a single MacBook Pro (M3 Max, 128 GB RAM). With an average draw of ~100 W, a 60-hour pass consumes ≈6 kWh (~$1.50 at SoCal off-peak rates) with zero cloud/API spend.
@@ -60,7 +60,7 @@ Huge thanks to **tensonaut** for the foundational OCR and dataset packaging; thi
 
 - Python 3.9+
 - `requests`
-- LM Studio (or another OpenAI-compatible gateway) serving `openai/gpt-oss-120b` locally at `http://localhost:5002/v1`
+- LM Studio (or another OpenAI-compatible gateway) serving `qwen/qwen3-coder-next` locally at `http://localhost:5002/v1`
 - The dataset CSV (`data/EPS_FILES_20K_NOV2026.csv`). **Not included in this repo**—download it from the Hugging Face link above and place it in `data/` (see `data/README.md` for instructions).
 
 Install Python deps (only `requests` is needed):
@@ -80,7 +80,8 @@ python gpt_ranker.py \
   --output data/epstein_ranked.csv \
   --json-output data/epstein_ranked.jsonl \
   --endpoint http://localhost:5002/v1 \
-  --model openai/gpt-oss-120b \
+  --model qwen/qwen3-coder-next \
+  --max-parallel-requests 4 \
   --resume \
   --sleep 0.5 \
   --config ranker_config.toml \
@@ -94,9 +95,17 @@ Notable flags:
 
 - `--prompt-file`: specify a custom system prompt file (defaults to `prompts/default_system_prompt.txt`). See `prompts/README.md` for details on creating custom prompts.
 - `--system-prompt`: provide an inline system prompt string (overrides `--prompt-file`).
+- `--input`: accepts either the legacy CSV (`filename` + `text`) or a directory tree of `.txt` files.
+- `--input-glob`: glob pattern used when `--input` is a directory (default `*.txt`, recursive).
+- `--dataset-workspace-root` + `--dataset-tag`: isolate this corpus into its own workspace (`results/`, `chunks/`, `state/`, `metadata/`) so outputs do not mix with the oversight dataset.
+- `--dataset-source-label`, `--dataset-source-url`, `--dataset-metadata-file`: attach provenance details; if `--run-metadata-file` is set (or auto-set in workspace mode), a run metadata JSON is written.
 - `--resume`: skips rows already present in the JSONL/checkpoint so you can stop/restart long runs.
 - `--checkpoint data/.epstein_checkpoint`: stores processed filenames to guard against duplication.
 - `--reasoning-effort low/high`: trade accuracy for speed if your model exposes the reasoning control knob.
+- `--max-parallel-requests`: number of concurrent requests to LM Studio (default `4`).
+- `--skip-low-quality` / `--no-skip-low-quality`: enable/disable pre-LLM filtering for empty/short/noisy OCR rows.
+- `--min-text-chars`, `--min-text-words`, `--min-alpha-ratio`, `--min-unique-word-ratio`, `--max-repeated-char-run`: tune skip thresholds.
+- `--justice-files-base-url`: base URL used to derive DOJ PDF links (stored as `source_pdf_url` and shown in the viewer).
 - `--include-action-items`: opt-in if you want the LLM to list action items (off by default for brevity).
 - `--timeout`: HTTP request timeout in seconds (default: 600 = 10 minutes). Increase for very large documents (100K+ tokens).
 - `--max-rows N`: smoke-test on a small subset.
@@ -109,9 +118,30 @@ Notable flags:
 
 Outputs:
 
-- `contrib/epstein_ranked_<start>_<end>.jsonl` – Default chunked outputs (one file per 1,000 rows) that contain the headline, score, metadata, and original text for each document.
+- `contrib/epstein_ranked_<start>_<end>.jsonl` – Default chunked outputs (one file per 1,000 rows) that contain the headline, score, metadata, and original text for each document. Skipped files are retained with `processing_status=skipped` and `skip_reason`.
 - `data/chunks.json` – Manifest listing all chunk files (the viewer uses this to load data).
 - `data/epstein_ranked.csv/jsonl` – Only produced if you disable chunking via `--chunk-size 0`.
+- `data/workspaces/<dataset-tag>/metadata/run_metadata.json` – Optional run provenance sidecar (enabled automatically in workspace mode).
+
+### Independent Corpus Workspace
+
+For large non-oversight corpora (like `data/new_data`), run in isolated workspace mode:
+
+```bash
+python gpt_ranker.py \
+  --input data/new_data \
+  --input-glob "*.txt" \
+  --dataset-workspace-root data/workspaces \
+  --dataset-tag standardworks_epstein_files \
+  --dataset-source-label "StandardWorks Epstein Files" \
+  --dataset-source-url "https://standardworks.ai/epstein-files" \
+  --dataset-metadata-file data/dataset_profiles/standardworks_epstein_files.json \
+  --max-parallel-requests 4 \
+  --resume
+```
+
+This keeps outputs/checkpoints/chunks independent from the original `contrib/` + `data/chunks.json` workflow.
+`data/workspaces/` is git-ignored by default.
 
 ### Chunk Manifest
 

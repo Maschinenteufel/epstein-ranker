@@ -52,17 +52,25 @@
 
     <header>
       <div>
-        <h1>U.S. House Oversight Epstein Estate Documents</h1>
-        <p>AI-ranked analysis of 20,000+ pages released by the House Oversight Committee. These are the estate documents already made public—not the unreleased files still pending disclosure.</p>
+        <h1 id="datasetTitle">U.S. House Oversight Epstein Estate Documents</h1>
+        <p id="datasetSubtitle">AI-ranked analysis of 20,000+ pages released by the House Oversight Committee. These are the estate documents already made public—not the unreleased files still pending disclosure.</p>
       </div>
     </header>
 
     <div class="processing-notice">
-      <strong>Note:</strong> We are still processing the remaining files. Currently showing <span id="processedCount">—</span> of ~25,800 documents.
+      <strong id="processingLabel">Note:</strong>
+      <span id="processingIntro">We are still processing the remaining files. Currently showing</span>
+      <span id="processedCount">—</span>
+      <span id="datasetEstimate">of ~25,800 documents.</span>
       <span id="filterWaitNote" class="filter-wait-note hidden">Please wait for data to finish loading before using filters.</span>
     </div>
 
     <section class="controls">
+      <div class="control-group">
+        <label for="datasetSelector">Dataset</label>
+        <select id="datasetSelector"></select>
+      </div>
+
       <div class="control-group">
         <label for="scoreFilter">Minimum Importance Score: <span id="scoreValue">0</span></label>
         <input type="range" id="scoreFilter" min="0" max="100" value="0" step="1" />
@@ -144,6 +152,8 @@
           <p id="detailTags">—</p>
           <h3>Model</h3>
           <p id="detailModel">—</p>
+          <h3>Justice PDF</h3>
+          <p><a id="detailSourceUrl" href="#" target="_blank" rel="noopener noreferrer">—</a></p>
         </article>
         <article class="detail-text">
           <div class="detail-text-header">
@@ -179,7 +189,7 @@
       <details class="methodology-collapse">
         <summary>How the Importance Score Works</summary>
         <p>
-          Each document is analyzed locally through LM Studio using the open-source OpenAI GPT-OSS-120B model, running entirely offline on
+          Each document is analyzed locally through LM Studio using the open-source Qwen3 Coder Next model, running entirely offline on
           commodity hardware. The model scores passages from 0 (no meaningful lead) to 100 (critical revelation).
         </p>
         <details class="accordion" open>
