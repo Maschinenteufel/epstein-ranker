@@ -514,6 +514,7 @@ select[multiple] {
   border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 12px;
   padding: 0.9rem;
+  min-height: 0;
 }
 
 .detail-content h3 {
@@ -527,11 +528,50 @@ select[multiple] {
   white-space: pre-wrap;
 }
 
+.source-link-list {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.source-link-item {
+  display: flex;
+  gap: 0.4rem;
+  align-items: baseline;
+  flex-wrap: wrap;
+  margin: 0;
+}
+
+.source-link-label {
+  color: var(--muted);
+  font-size: 0.82rem;
+  min-width: 4.75rem;
+}
+
+.source-link-item a.disabled {
+  color: var(--muted);
+  text-decoration: none;
+  pointer-events: none;
+}
+
 .detail-content ul {
   margin: 0;
   padding-left: 1.2rem;
   color: var(--muted);
   max-height: 200px;
+  overflow: auto;
+}
+
+/* Let Key Insights use the full card height before scrolling. */
+.detail-content article:first-child {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+#detailInsights {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: none;
   overflow: auto;
 }
 

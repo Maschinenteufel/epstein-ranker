@@ -72,6 +72,8 @@ const elements = {
   detailTags: document.getElementById("detailTags"),
   detailModel: document.getElementById("detailModel"),
   detailSourceUrl: document.getElementById("detailSourceUrl"),
+  detailSourceJustice: document.getElementById("detailSourceJustice"),
+  detailSourceLocal: document.getElementById("detailSourceLocal"),
   detailTextPanel: document.getElementById("detailTextPanel"),
   detailText: document.getElementById("detailText"),
   detailTextPreview: document.getElementById("detailTextPreview"),
@@ -637,6 +639,45 @@ function deriveJusticePdfUrl(row) {
   return `https://www.justice.gov/epstein/files/DataSet%20${datasetNumber}/${eftaId}.pdf`;
 }
 
+function deriveLocalSourceUrl(row) {
+  const coerceDataPath = (value) => {
+    if (!value || typeof value !== "string") return null;
+    const text = value.trim();
+    if (!text) return null;
+    if (/^https?:\/\//i.test(text)) return text;
+    if (text.startsWith("/data/")) return text;
+    if (text.startsWith("data/")) return `/${text}`;
+    const normalized = text.replace(/\\/g, "/");
+    const dataIndex = normalized.toLowerCase().indexOf("/data/");
+    if (dataIndex >= 0) {
+      return normalized.slice(dataIndex);
+    }
+    return null;
+  };
+
+  const directCandidates = [
+    row?.local_source_url,
+    row?.metadata?.local_source_url,
+    row?.metadata?.original_row?.source_path,
+  ];
+  for (const candidate of directCandidates) {
+    const resolved = coerceDataPath(candidate);
+    if (resolved) return resolved;
+  }
+
+  const filename =
+    (typeof row?.filename === "string" && row.filename.trim()) ||
+    (typeof row?.metadata?.original_row?.filename === "string" &&
+      row.metadata.original_row.filename.trim()) ||
+    "";
+  const volume = deriveVolumeLabel(row);
+  if (filename && volume) {
+    const cleanFilename = filename.replace(/^\/+/, "");
+    return `/data/new_data/${volume}/${cleanFilename}`;
+  }
+  return null;
+}
+
 function deriveVolumeLabel(row) {
   const formatVolume = (num) => `VOL${String(num).padStart(5, "0")}`;
   const readVolume = (value) => {
@@ -702,6 +743,16 @@ function normalizeRow(row) {
       })()
     : "";
   const derivedJusticePdfUrl = deriveJusticePdfUrl(row);
+  const justiceSourceUrl =
+    (typeof row.justice_source_url === "string" && row.justice_source_url) ||
+    (typeof row.metadata?.justice_source_url === "string" && row.metadata.justice_source_url) ||
+    derivedJusticePdfUrl ||
+    null;
+  const localSourceUrl =
+    (typeof row.local_source_url === "string" && row.local_source_url) ||
+    (typeof row.metadata?.local_source_url === "string" && row.metadata.local_source_url) ||
+    deriveLocalSourceUrl(row) ||
+    null;
   const normalized = {
     source_id: sourceId,
     filename: row.filename,
@@ -726,10 +777,14 @@ function normalizeRow(row) {
     agency_involvement: arrays(row.agency_involvement),
     lead_types: arrays(row.lead_types),
     metadata: row.metadata || {},
+    justice_source_url: justiceSourceUrl,
+    local_source_url: localSourceUrl,
     source_pdf_url:
+      (typeof row.source_pdf_url === "string" && row.source_pdf_url) ||
+      (typeof row.metadata?.source_pdf_url === "string" && row.metadata.source_pdf_url) ||
+      justiceSourceUrl ||
+      localSourceUrl ||
       derivedJusticePdfUrl ||
-      row.source_pdf_url ||
-      row.metadata?.source_pdf_url ||
       null,
     original_text:
       typeof row.metadata?.original_row?.text === "string"
@@ -1297,25 +1352,103 @@ async function loadData() {
 
 async function fetchDatasetManifest(dataset) {
   const primary = await fetchManifest(dataset.manifestUrl);
-  if (primary && primary.chunks && primary.chunks.length > 0) {
-    return primary;
-  }
   if (dataset.volumeManifestPrefix && dataset.volumeCount) {
-    const merged = await fetchVolumeManifests(dataset.volumeManifestPrefix, dataset.volumeCount);
-    if (merged && merged.chunks && merged.chunks.length > 0) {
-      return merged;
-    }
+    const volumeMerged = await fetchVolumeManifests(
+      dataset.volumeManifestPrefix,
+      dataset.volumeCount,
+      { probeMissingVolumes: true, chunkSize: dataset.fallbackChunkSize || DEFAULT_CHUNK_SIZE }
+    );
+    const merged = mergeManifests(primary, volumeMerged);
+    if (merged && merged.chunks && merged.chunks.length > 0) return merged;
   }
+  if (primary && primary.chunks && primary.chunks.length > 0) return primary;
   return primary;
 }
 
-async function fetchVolumeManifests(prefix, volumeCount) {
+function mergeManifests(primary, secondary) {
+  if (!primary && !secondary) return null;
+  if (!primary) return secondary;
+  if (!secondary) return primary;
+
+  const deduped = new Map();
+  const pushChunks = (manifest) => {
+    if (!manifest || !Array.isArray(manifest.chunks)) return;
+    for (const chunk of manifest.chunks) {
+      if (!chunk || !chunk.json) continue;
+      const key = `${chunk.start_row || 0}:${chunk.end_row || 0}:${chunk.json}`;
+      if (!deduped.has(key)) {
+        deduped.set(key, chunk);
+      }
+    }
+  };
+  pushChunks(primary);
+  pushChunks(secondary);
+
+  const chunks = Array.from(deduped.values()).sort((a, b) => {
+    const aPath = String(a.json || "");
+    const bPath = String(b.json || "");
+    if (aPath !== bPath) return aPath.localeCompare(bPath);
+    return (a.start_row || 0) - (b.start_row || 0);
+  });
+
+  const pMeta = primary.metadata || {};
+  const sMeta = secondary.metadata || {};
+  const pRows = typeof pMeta.rows_processed === "number" ? pMeta.rows_processed : 0;
+  const sRows = typeof sMeta.rows_processed === "number" ? sMeta.rows_processed : 0;
+  const pUpdated = pMeta.last_updated ? String(pMeta.last_updated) : "";
+  const sUpdated = sMeta.last_updated ? String(sMeta.last_updated) : "";
+  const pTotal = pMeta.total_dataset_rows;
+  const sTotal = sMeta.total_dataset_rows;
+
+  return {
+    metadata: {
+      total_dataset_rows:
+        typeof pTotal === "number" || (typeof pTotal === "string" && pTotal !== "unknown")
+          ? pTotal
+          : sTotal || "unknown",
+      rows_processed: Math.max(pRows, sRows),
+      last_updated: pUpdated > sUpdated ? pUpdated : sUpdated || null,
+    },
+    chunks,
+  };
+}
+
+async function probeVolumeFirstChunk(prefix, volume, chunkSize = DEFAULT_CHUNK_SIZE) {
+  const start = 1;
+  const end = start + chunkSize - 1;
+  const path = `${prefix}/VOL${volume}/epstein_ranked_${String(start).padStart(5, "0")}_${String(
+    end
+  ).padStart(5, "0")}.jsonl`;
+  try {
+    let response = await fetch(`${path}?t=${Date.now()}`, { method: "HEAD" });
+    if (!response.ok && (response.status === 405 || response.status === 501)) {
+      response = await fetch(`${path}?t=${Date.now()}`);
+    }
+    if (!response.ok) return null;
+    return { start_row: start, end_row: end, json: path.replace(/^\//, "") };
+  } catch (_error) {
+    return null;
+  }
+}
+
+async function fetchVolumeManifests(prefix, volumeCount, options = {}) {
+  const probeMissingVolumes = !!options.probeMissingVolumes;
+  const chunkSize = Number(options.chunkSize) > 0 ? Number(options.chunkSize) : DEFAULT_CHUNK_SIZE;
   const manifests = [];
   for (let i = 1; i <= volumeCount; i += 1) {
     const vol = String(i).padStart(5, "0");
     const manifestUrl = `${prefix}/VOL${vol}/chunks.json`;
     const manifest = await fetchManifest(manifestUrl);
     if (!manifest || !Array.isArray(manifest.chunks) || manifest.chunks.length === 0) {
+      if (probeMissingVolumes) {
+        const probedChunk = await probeVolumeFirstChunk(prefix, vol, chunkSize);
+        if (probedChunk) {
+          manifests.push({
+            chunks: [probedChunk],
+            metadata: { total_dataset_rows: "unknown", rows_processed: 0, last_updated: null },
+          });
+        }
+      }
       continue;
     }
     manifests.push(manifest);
@@ -1953,13 +2086,23 @@ function renderDetail(row, options = {}) {
   // Display model if available in metadata
   const model = row.metadata?.config?.model || "—";
   elements.detailModel.textContent = model;
-  if (row.source_pdf_url) {
-    elements.detailSourceUrl.textContent = "Open source file";
-    elements.detailSourceUrl.href = row.source_pdf_url;
-  } else {
-    elements.detailSourceUrl.textContent = "—";
-    elements.detailSourceUrl.removeAttribute("href");
-  }
+  const setDetailLink = (element, text, href) => {
+    if (!element) return;
+    if (href) {
+      element.textContent = text;
+      element.href = href;
+      element.classList.remove("disabled");
+      return;
+    }
+    element.textContent = "Not available";
+    element.removeAttribute("href");
+    element.classList.add("disabled");
+  };
+
+  const resolvedSourceUrl = row.source_pdf_url || row.justice_source_url || row.local_source_url || null;
+  setDetailLink(elements.detailSourceUrl, "Open source file", resolvedSourceUrl);
+  setDetailLink(elements.detailSourceJustice, "Open DOJ source", row.justice_source_url || null);
+  setDetailLink(elements.detailSourceLocal, "Open local reference", row.local_source_url || null);
 
   // Hide the text panel entirely when no source text is available (image-first runs).
   const originalText = (row.original_text || "").trim();
@@ -2007,6 +2150,17 @@ function clearDetail() {
   elements.detailModel.textContent = "—";
   elements.detailSourceUrl.textContent = "—";
   elements.detailSourceUrl.removeAttribute("href");
+  elements.detailSourceUrl.classList.remove("disabled");
+  if (elements.detailSourceJustice) {
+    elements.detailSourceJustice.textContent = "—";
+    elements.detailSourceJustice.removeAttribute("href");
+    elements.detailSourceJustice.classList.remove("disabled");
+  }
+  if (elements.detailSourceLocal) {
+    elements.detailSourceLocal.textContent = "—";
+    elements.detailSourceLocal.removeAttribute("href");
+    elements.detailSourceLocal.classList.remove("disabled");
+  }
   if (elements.detailTextPanel) {
     elements.detailTextPanel.classList.remove("hidden");
   }
