@@ -1327,6 +1327,9 @@ def build_config_metadata(args: argparse.Namespace, prompt_source: str) -> Dict[
         metadata["dataset_source_url"] = args.dataset_source_url
     if args.reasoning_effort is not None:
         metadata["reasoning_effort"] = args.reasoning_effort
+    if args.openrouter_provider:
+        metadata["openrouter_provider"] = args.openrouter_provider
+        metadata["openrouter_allow_fallbacks"] = not args.openrouter_no_fallbacks
     metadata["skip_low_quality"] = args.skip_low_quality
     metadata["skip_thresholds"] = {
         "min_text_chars": args.min_text_chars,
@@ -1807,6 +1810,18 @@ def main() -> None:
             "OpenRouter endpoint detected but --api-key is missing. "
             "Provide --api-key or set it via your config."
         )
+    if args.openrouter_provider and "openrouter.ai" not in args.endpoint:
+        print(
+            "WARNING: --openrouter-provider is set but endpoint is not openrouter.ai; "
+            "provider routing preferences will be ignored.",
+            flush=True,
+        )
+    if args.openrouter_no_fallbacks and not args.openrouter_provider:
+        print(
+            "WARNING: --openrouter-no-fallbacks was set without --openrouter-provider; "
+            "no provider preference will be applied.",
+            flush=True,
+        )
     if args.start_row < 1:
         sys.exit("--start-row must be >= 1")
     if args.end_row is not None and args.end_row < args.start_row:
@@ -1879,6 +1894,13 @@ def main() -> None:
         flush=True,
     )
     if "openrouter.ai" in args.endpoint:
+        if args.openrouter_provider:
+            print(
+                "OpenRouter provider routing: "
+                f"provider={args.openrouter_provider} | "
+                f"fallbacks={'disabled' if args.openrouter_no_fallbacks else 'enabled'}",
+                flush=True,
+            )
         if args.input_price_per_1m is not None or args.output_price_per_1m is not None:
             print(
                 "API token pricing enabled for cost tracking: "
@@ -2412,6 +2434,12 @@ def main() -> None:
                 "request_semaphore": request_semaphore,
                 "http_referer": args.http_referer,
                 "x_title": args.x_title,
+                "openrouter_provider": args.openrouter_provider,
+                "openrouter_allow_fallbacks": (
+                    None
+                    if not args.openrouter_provider
+                    else (not args.openrouter_no_fallbacks)
+                ),
                 "config_metadata": config_metadata,
             }
 
@@ -2489,6 +2517,12 @@ def main() -> None:
                     request_semaphore=request_semaphore,
                     http_referer=args.http_referer,
                     x_title=args.x_title,
+                    openrouter_provider=args.openrouter_provider,
+                    openrouter_allow_fallbacks=(
+                        None
+                        if not args.openrouter_provider
+                        else (not args.openrouter_no_fallbacks)
+                    ),
                     config_metadata=config_metadata,
                 )
                 in_flight[future] = {

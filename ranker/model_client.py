@@ -777,6 +777,8 @@ def call_model(
     request_semaphore: Optional[threading.Semaphore] = None,
     http_referer: Optional[str] = None,
     x_title: Optional[str] = None,
+    openrouter_provider: Optional[str] = None,
+    openrouter_allow_fallbacks: Optional[bool] = None,
     config_metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     if input_kind not in {"text", "image"}:
@@ -828,6 +830,11 @@ def call_model(
         )
 
     last_error: Optional[Exception] = None
+    normalized_openrouter_provider = (
+        openrouter_provider.strip()
+        if isinstance(openrouter_provider, str) and openrouter_provider.strip()
+        else None
+    )
     for attempt in range(1, max_retries + 1):
         saw_retriable_error = False
         for mode, base_url in targets:
@@ -880,6 +887,19 @@ def call_model(
                         payload["reasoning"] = {"effort": reasoning_effort}
                     if config_metadata:
                         payload["metadata"] = config_metadata
+                    provider_preferences: Optional[Dict[str, Any]] = None
+                    if "openrouter.ai" in base_url:
+                        provider_preferences = {}
+                        if normalized_openrouter_provider:
+                            provider_preferences["order"] = [normalized_openrouter_provider]
+                        if openrouter_allow_fallbacks is not None:
+                            provider_preferences["allow_fallbacks"] = bool(
+                                openrouter_allow_fallbacks
+                            )
+                        if not provider_preferences:
+                            provider_preferences = None
+                    if provider_preferences:
+                        payload["provider"] = provider_preferences
                     request_started = time.monotonic()
                     data = send_request(url=f"{base_url}/chat/completions", payload=payload)
                     request_seconds = time.monotonic() - request_started
@@ -891,6 +911,7 @@ def call_model(
                         "system_prompt": system_prompt,
                         "input": doc_input,
                     }
+                    provider_preferences = None
                     request_started = time.monotonic()
                     data = send_request(url=f"{base_url}/chat", payload=payload)
                     request_seconds = time.monotonic() - request_started
@@ -910,6 +931,7 @@ def call_model(
                         "source_total_pages": source_total_pages,
                         "usage": usage,
                         "provider_reported_cost_usd": provider_reported_cost_usd,
+                        "provider_preferences": provider_preferences,
                     }
                     return parsed
                 except (json.JSONDecodeError, TypeError, ValueError) as exc:

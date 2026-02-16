@@ -272,6 +272,23 @@ def parse_args() -> argparse.Namespace:
         help="Optional X-Title header (recommended by OpenRouter).",
     )
     parser.add_argument(
+        "--openrouter-provider",
+        default=None,
+        help=(
+            "Optional OpenRouter provider slug/name for routing preferences "
+            "(example: alibaba)."
+        ),
+    )
+    parser.add_argument(
+        "--openrouter-no-fallbacks",
+        action="store_true",
+        default=False,
+        help=(
+            "Disable OpenRouter provider fallback routing (fail fast if the selected "
+            "provider cannot serve the request)."
+        ),
+    )
+    parser.add_argument(
         "--reasoning-effort",
         choices=["low", "medium", "high"],
         help="If provided, passes reasoning effort hints supported by some models.",

@@ -92,3 +92,5 @@ checkpoint = "data/.epstein_checkpoint"
 # api_key = "sk-or-..."
 # http_referer = "https://your-app.example"
 # x_title = "Epstein File Ranker"
+# openrouter_provider = "alibaba"  # Optional provider routing pin (slug/name)
+# openrouter_no_fallbacks = true  # Optional strict mode: fail instead of auto-fallback

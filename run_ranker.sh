@@ -34,6 +34,8 @@ OPENROUTER_MODEL="qwen/qwen3-vl-30b-a3b-instruct"
 OPENROUTER_API_KEY="${OPENROUTER_API_KEY:-}"
 OPENROUTER_REFERER="${OPENROUTER_REFERER:-}"
 OPENROUTER_TITLE="${OPENROUTER_TITLE:-Epstein File Ranker}"
+OPENROUTER_PROVIDER="${OPENROUTER_PROVIDER:-}"
+OPENROUTER_NO_FALLBACKS="${OPENROUTER_NO_FALLBACKS:-0}"
 API_KEY=""
 HTTP_REFERER=""
 X_TITLE=""
@@ -104,6 +106,10 @@ Model/runtime options:
   --openrouter-api-key KEY   OpenRouter key (or set OPENROUTER_API_KEY)
   --openrouter-referer URL   OpenRouter referer override (or OPENROUTER_REFERER)
   --openrouter-title NAME    OpenRouter title override (or OPENROUTER_TITLE)
+  --openrouter-provider ID   OpenRouter provider slug/name (example: alibaba)
+  --openrouter-no-fallbacks  Disable OpenRouter provider fallback routing
+  --openrouter-allow-fallbacks
+                             Allow OpenRouter provider fallback routing (default)
   --parallel N               Max parallel requests (default: 4)
   --parallel-scheduling MODE auto | window | batch (default: batch)
   --image-prefetch N         Extra queued image tasks beyond --parallel (default: 0)
@@ -140,6 +146,7 @@ Control options:
 Examples:
   ./run_ranker.sh --volumes 1
   ./run_ranker.sh --provider openrouter --openrouter-api-key sk-... --volumes 1 --parallel 2
+  ./run_ranker.sh --provider openrouter --openrouter-provider alibaba --openrouter-no-fallbacks --volumes 1
   ./run_ranker.sh --volumes 1,2,6-8 --parallel 4 --dry-run
   ./run_ranker.sh --volumes all --strict-missing
   ./run_ranker.sh --volumes 1 -- --reasoning-effort low --sleep 0.5
@@ -327,6 +334,8 @@ while [[ $# -gt 0 ]]; do
       OPENROUTER_API_KEY="${OPENROUTER_API_KEY:-}"
       OPENROUTER_REFERER="${OPENROUTER_REFERER:-}"
       OPENROUTER_TITLE="${OPENROUTER_TITLE:-Epstein File Ranker}"
+      OPENROUTER_PROVIDER="${OPENROUTER_PROVIDER:-}"
+      OPENROUTER_NO_FALLBACKS="${OPENROUTER_NO_FALLBACKS:-0}"
       shift 2
       ;;
     --openrouter-api-key)
@@ -340,6 +349,18 @@ while [[ $# -gt 0 ]]; do
     --openrouter-title)
       OPENROUTER_TITLE="$2"
       shift 2
+      ;;
+    --openrouter-provider)
+      OPENROUTER_PROVIDER="$2"
+      shift 2
+      ;;
+    --openrouter-no-fallbacks)
+      OPENROUTER_NO_FALLBACKS="1"
+      shift
+      ;;
+    --openrouter-allow-fallbacks)
+      OPENROUTER_NO_FALLBACKS="0"
+      shift
       ;;
     --parallel)
       MAX_PARALLEL_REQUESTS="$2"
@@ -557,6 +578,13 @@ echo "Workspace root: $WORKSPACE_ROOT"
 echo "Provider: $PROVIDER"
 echo "Model: $MODEL"
 echo "Endpoint: $ENDPOINT"
+if [[ "$PROVIDER" == "openrouter" && -n "$OPENROUTER_PROVIDER" ]]; then
+  if [[ "$OPENROUTER_NO_FALLBACKS" == "1" ]]; then
+    echo "OpenRouter route: provider=$OPENROUTER_PROVIDER | fallbacks=disabled"
+  else
+    echo "OpenRouter route: provider=$OPENROUTER_PROVIDER | fallbacks=enabled"
+  fi
+fi
 if [[ -n "$INPUT_PRICE_PER_1M" || -n "$OUTPUT_PRICE_PER_1M" || -n "$CACHE_READ_PRICE_PER_1M" || -n "$CACHE_WRITE_PRICE_PER_1M" ]]; then
   echo "Token pricing (USD / 1M): input=${INPUT_PRICE_PER_1M:-unset}, output=${OUTPUT_PRICE_PER_1M:-unset}, cache_read=${CACHE_READ_PRICE_PER_1M:-unset}, cache_write=${CACHE_WRITE_PRICE_PER_1M:-unset}"
 fi
@@ -627,6 +655,12 @@ for vol in "${VOLUMES[@]}"; do
   fi
   if [[ -n "$X_TITLE" ]]; then
     CMD+=(--x-title "$X_TITLE")
+  fi
+  if [[ -n "$OPENROUTER_PROVIDER" ]]; then
+    CMD+=(--openrouter-provider "$OPENROUTER_PROVIDER")
+  fi
+  if [[ "$OPENROUTER_NO_FALLBACKS" == "1" ]]; then
+    CMD+=(--openrouter-no-fallbacks)
   fi
   if (( RESUME )); then
     CMD+=(--resume)
