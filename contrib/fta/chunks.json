@@ -1,14 +1,29 @@
 {
   "metadata": {
     "total_dataset_rows": "unknown",
-    "rows_processed": 1530,
-    "last_updated": "2026-02-15 23:46:53"
+    "rows_processed": 12341,
+    "last_updated": "2026-02-16 04:02:36"
   },
   "chunks": [
     {
       "start_row": 1,
       "end_row": 1000,
       "json": "contrib/fta/VOL00001/epstein_ranked_00001_01000.jsonl"
+    },
+    {
+      "start_row": 1001,
+      "end_row": 2000,
+      "json": "contrib/fta/VOL00001/epstein_ranked_01001_02000.jsonl"
+    },
+    {
+      "start_row": 2001,
+      "end_row": 3000,
+      "json": "contrib/fta/VOL00001/epstein_ranked_02001_03000.jsonl"
+    },
+    {
+      "start_row": 3001,
+      "end_row": 4000,
+      "json": "contrib/fta/VOL00001/epstein_ranked_03001_04000.jsonl"
     },
     {
       "start_row": 1,
@@ -39,6 +54,46 @@
       "start_row": 1,
       "end_row": 1000,
       "json": "contrib/fta/VOL00011/epstein_ranked_00001_01000.jsonl"
+    },
+    {
+      "start_row": 1001,
+      "end_row": 2000,
+      "json": "contrib/fta/VOL00011/epstein_ranked_01001_02000.jsonl"
+    },
+    {
+      "start_row": 2001,
+      "end_row": 3000,
+      "json": "contrib/fta/VOL00011/epstein_ranked_02001_03000.jsonl"
+    },
+    {
+      "start_row": 3001,
+      "end_row": 4000,
+      "json": "contrib/fta/VOL00011/epstein_ranked_03001_04000.jsonl"
+    },
+    {
+      "start_row": 4001,
+      "end_row": 5000,
+      "json": "contrib/fta/VOL00011/epstein_ranked_04001_05000.jsonl"
+    },
+    {
+      "start_row": 5001,
+      "end_row": 6000,
+      "json": "contrib/fta/VOL00011/epstein_ranked_05001_06000.jsonl"
+    },
+    {
+      "start_row": 6001,
+      "end_row": 7000,
+      "json": "contrib/fta/VOL00011/epstein_ranked_06001_07000.jsonl"
+    },
+    {
+      "start_row": 7001,
+      "end_row": 8000,
+      "json": "contrib/fta/VOL00011/epstein_ranked_07001_08000.jsonl"
+    },
+    {
+      "start_row": 8001,
+      "end_row": 9000,
+      "json": "contrib/fta/VOL00011/epstein_ranked_08001_09000.jsonl"
     },
     {
       "start_row": 1,
