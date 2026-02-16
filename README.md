@@ -60,7 +60,7 @@ Huge thanks to **tensonaut** for the foundational OCR and dataset packaging; thi
 
 - Python 3.9+
 - `requests`
-- LM Studio (or another OpenAI-compatible gateway) serving `qwen/qwen3-coder-next` locally at `http://localhost:5002/v1`
+- LM Studio (or another local gateway) serving `qwen/qwen3-coder-next` locally at `http://localhost:5555/api/v1`
 - The dataset CSV (`data/EPS_FILES_20K_NOV2026.csv`). **Not included in this repo**—download it from the Hugging Face link above and place it in `data/` (see `data/README.md` for instructions).
 
 Install Python deps (only `requests` is needed):
@@ -79,7 +79,8 @@ python gpt_ranker.py \
   --input data/EPS_FILES_20K_NOV2026.csv \
   --output data/epstein_ranked.csv \
   --json-output data/epstein_ranked.jsonl \
-  --endpoint http://localhost:5002/v1 \
+  --endpoint http://localhost:5555/api/v1 \
+  --api-format auto \
   --model qwen/qwen3-coder-next \
   --max-parallel-requests 4 \
   --resume \
@@ -103,6 +104,8 @@ Notable flags:
 - `--checkpoint data/.epstein_checkpoint`: stores processed filenames to guard against duplication.
 - `--reasoning-effort low/high`: trade accuracy for speed if your model exposes the reasoning control knob.
 - `--max-parallel-requests`: number of concurrent requests to LM Studio (default `4`).
+- `--api-format`: `auto` (default), `openai`, or `chat`. Use `chat` for LM Studio `/api/v1/chat` style endpoints.
+- `--max-retries`, `--retry-backoff`: retry transient endpoint failures with exponential backoff.
 - `--skip-low-quality` / `--no-skip-low-quality`: enable/disable pre-LLM filtering for empty/short/noisy OCR rows.
 - `--min-text-chars`, `--min-text-words`, `--min-alpha-ratio`, `--min-unique-word-ratio`, `--max-repeated-char-run`: tune skip thresholds.
 - `--justice-files-base-url`: base URL used to derive DOJ PDF links (stored as `source_pdf_url` and shown in the viewer).
@@ -115,6 +118,12 @@ Notable flags:
 - `--chunk-size`, `--chunk-dir`, `--chunk-manifest`: control chunk splitting, where chunk files live, and where the manifest is written.
 - `--overwrite-output`: explicitly allow truncating existing files (default is to refuse unless `--resume` or unique paths are used).
 - `--power-watts`, `--electric-rate`, `--run-hours`: plug in your local power draw/cost to estimate total electricity usage (also configurable via the TOML file).
+
+Pause/resume behavior:
+
+- Press `Ctrl+C` to pause gracefully.
+- The ranker flushes completed rows, preserves the checkpoint, and exits with resume instructions.
+- Restart with `--resume` to continue from where it left off.
 
 Outputs:
 

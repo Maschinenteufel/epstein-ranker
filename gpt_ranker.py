@@ -135,6 +135,20 @@ AGENCY_CANONICAL_MAP = {
 
 DEFAULT_JUSTICE_FILES_BASE_URL = "https://www.justice.gov/epstein/files"
 
+RETRIABLE_HTTP_STATUS_CODES = {408, 409, 425, 429}
+
+
+class UnsupportedEndpointError(RuntimeError):
+    """Raised when a specific API route is unavailable on the target server."""
+
+
+class ModelRequestError(RuntimeError):
+    """Raised for model request failures with retriable vs permanent classification."""
+
+    def __init__(self, message: str, *, retriable: bool) -> None:
+        super().__init__(message)
+        self.retriable = retriable
+
 
 def explicit_cli_destinations(argv: List[str]) -> Set[str]:
     explicit: Set[str] = set()
@@ -226,7 +240,7 @@ def apply_config_defaults(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Call a local OpenAI-compatible server (e.g. qwen/qwen3-coder-next) to extract "
+            "Call a local model gateway (OpenAI-style or /chat style) to extract "
             "useful information and rank each source row."
         )
     )
@@ -296,8 +310,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--endpoint",
-        default="http://localhost:5002/v1",
-        help="Base URL of the OpenAI-compatible server.",
+        default="http://localhost:5555/api/v1",
+        help="Base URL of the local model gateway.",
+    )
+    parser.add_argument(
+        "--api-format",
+        choices=["auto", "openai", "chat"],
+        default="auto",
+        help=(
+            "Request format to use: openai (/chat/completions), chat (/chat), "
+            "or auto-detect/fallback."
+        ),
     )
     parser.add_argument(
         "--model",
@@ -416,6 +439,18 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=600.0,
         help="HTTP request timeout in seconds (default: 600 = 10 minutes).",
+    )
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=3,
+        help="Maximum request attempts for transient endpoint/model failures.",
+    )
+    parser.add_argument(
+        "--retry-backoff",
+        type=float,
+        default=1.5,
+        help="Base seconds for exponential retry backoff (attempt_n = backoff * 2^(n-1)).",
     )
     parser.add_argument(
         "--skip-low-quality",
@@ -537,63 +572,231 @@ def load_system_prompt(args: argparse.Namespace) -> Tuple[str, str]:
     return prompt, str(prompt_file)
 
 
+def build_analysis_input(filename: str, text: str) -> str:
+    return (
+        "Analyze the following document and respond with the JSON schema "
+        "described in the system prompt.\n"
+        f"Filename: {filename}\n"
+        "---------\n"
+        f"{text.strip()}\n"
+        "---------"
+    )
+
+
+def infer_api_priority(endpoint: str) -> List[str]:
+    normalized = endpoint.rstrip("/")
+    if normalized.endswith("/api/v1"):
+        return ["chat", "openai"]
+    return ["openai", "chat"]
+
+
+def derive_localhost_fallback_endpoint(endpoint: str) -> Optional[str]:
+    normalized = endpoint.rstrip("/")
+    if re.match(r"^https?://(?:localhost|127\.0\.0\.1):5555/api/v1$", normalized):
+        return None
+    if re.match(r"^https?://(?:localhost|127\.0\.0\.1)(?::\d+)?(?:/.*)?$", normalized):
+        scheme = "https" if normalized.startswith("https://") else "http"
+        host = "127.0.0.1" if "127.0.0.1" in normalized else "localhost"
+        return f"{scheme}://{host}:5555/api/v1"
+    return None
+
+
+def build_request_targets(endpoint: str, api_format: str) -> List[Tuple[str, str]]:
+    normalized = endpoint.rstrip("/")
+    targets: List[Tuple[str, str]] = []
+
+    if api_format == "openai":
+        targets.append(("openai", normalized))
+    elif api_format == "chat":
+        targets.append(("chat", normalized))
+    else:
+        for mode in infer_api_priority(normalized):
+            targets.append((mode, normalized))
+        fallback_endpoint = derive_localhost_fallback_endpoint(normalized)
+        if fallback_endpoint:
+            for mode in infer_api_priority(fallback_endpoint):
+                targets.append((mode, fallback_endpoint))
+
+    deduped: List[Tuple[str, str]] = []
+    seen: Set[Tuple[str, str]] = set()
+    for mode, base in targets:
+        key = (mode, base)
+        if key in seen:
+            continue
+        deduped.append(key)
+        seen.add(key)
+    return deduped
+
+
+def post_request(
+    *,
+    url: str,
+    payload: Dict[str, Any],
+    api_key: Optional[str],
+    timeout: float,
+) -> Dict[str, Any]:
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    try:
+        response = requests.post(url, json=payload, timeout=timeout, headers=headers)
+    except (requests.ConnectionError, requests.Timeout) as exc:
+        raise ModelRequestError(f"Request failed for {url}: {exc}", retriable=True) from exc
+    except requests.RequestException as exc:
+        raise ModelRequestError(f"Request failed for {url}: {exc}", retriable=False) from exc
+
+    if response.status_code in (404, 405):
+        raise UnsupportedEndpointError(
+            f"HTTP {response.status_code} from {url}: endpoint not supported by this server"
+        )
+    if response.status_code >= 400:
+        snippet = response.text[:500].replace("\n", " ")
+        retriable = (
+            response.status_code in RETRIABLE_HTTP_STATUS_CODES
+            or 500 <= response.status_code < 600
+        )
+        raise ModelRequestError(
+            f"HTTP {response.status_code} from {url}: {snippet}",
+            retriable=retriable,
+        )
+
+    try:
+        return response.json()
+    except json.JSONDecodeError as exc:
+        snippet = response.text[:500].replace("\n", " ")
+        raise ModelRequestError(
+            f"Invalid JSON response from {url}: {snippet}",
+            retriable=False,
+        ) from exc
+
+
+def extract_openai_content(data: Dict[str, Any]) -> str:
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise ModelRequestError(
+            f"Unexpected OpenAI response format: {data}",
+            retriable=False,
+        ) from exc
+    if not isinstance(content, str):
+        raise ModelRequestError(
+            f"Unexpected OpenAI response content type: {type(content)}",
+            retriable=False,
+        )
+    return content
+
+
+def extract_chat_content(data: Dict[str, Any]) -> str:
+    output = data.get("output")
+    if isinstance(output, list):
+        collected: List[str] = []
+        for item in output:
+            if isinstance(item, str):
+                collected.append(item)
+                continue
+            if isinstance(item, dict):
+                value = item.get("content")
+                if isinstance(value, str):
+                    collected.append(value)
+                    continue
+                value = item.get("text")
+                if isinstance(value, str):
+                    collected.append(value)
+        if collected:
+            return "\n".join(collected)
+
+    for key in ("content", "response", "text"):
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    raise ModelRequestError(
+        f"Unexpected chat response format: {data}",
+        retriable=False,
+    )
+
+
 def call_model(
     *,
     endpoint: str,
+    api_format: str,
     model: str,
     filename: str,
     text: str,
     system_prompt: str,
     api_key: Optional[str],
     timeout: float,
+    max_retries: int,
+    retry_backoff: float,
     temperature: float,
     reasoning_effort: Optional[str],
     config_metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Send the document to the local GPT server and return parsed JSON."""
-    payload = {
-        "model": model,
-        "temperature": temperature,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": (
-                    "Analyze the following document and respond with the JSON schema "
-                    "described in the system prompt.\n"
-                    f"Filename: {filename}\n"
-                    "---------\n"
-                    f"{text.strip()}\n"
-                    "---------"
-                ),
-            },
-        ],
-    }
-    if reasoning_effort:
-        payload["reasoning"] = {"effort": reasoning_effort}
+    """Send a document to the model endpoint and return parsed JSON output."""
+    doc_input = build_analysis_input(filename, text)
+    targets = build_request_targets(endpoint, api_format)
 
-    # Include config metadata in the request if provided
-    if config_metadata:
-        payload["metadata"] = config_metadata
+    last_error: Optional[Exception] = None
+    for attempt in range(1, max_retries + 1):
+        saw_retriable_error = False
+        for mode, base_url in targets:
+            try:
+                if mode == "openai":
+                    payload: Dict[str, Any] = {
+                        "model": model,
+                        "temperature": temperature,
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": doc_input},
+                        ],
+                    }
+                    if reasoning_effort:
+                        payload["reasoning"] = {"effort": reasoning_effort}
+                    if config_metadata:
+                        payload["metadata"] = config_metadata
+                    data = post_request(
+                        url=f"{base_url}/chat/completions",
+                        payload=payload,
+                        api_key=api_key,
+                        timeout=timeout,
+                    )
+                    content = extract_openai_content(data)
+                else:
+                    payload = {
+                        "model": model,
+                        "system_prompt": system_prompt,
+                        "input": doc_input,
+                    }
+                    data = post_request(
+                        url=f"{base_url}/chat",
+                        payload=payload,
+                        api_key=api_key,
+                        timeout=timeout,
+                    )
+                    content = extract_chat_content(data)
+                return ensure_json_dict(content)
+            except UnsupportedEndpointError as exc:
+                last_error = exc
+                continue
+            except ModelRequestError as exc:
+                last_error = exc
+                saw_retriable_error = saw_retriable_error or exc.retriable
+                continue
 
-    headers = {}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
+        if attempt < max_retries and saw_retriable_error:
+            sleep_seconds = retry_backoff * (2 ** (attempt - 1))
+            time.sleep(max(0.0, sleep_seconds))
+            continue
+        break
 
-    url = f"{endpoint.rstrip('/')}/chat/completions"
-    response = requests.post(url, json=payload, timeout=timeout, headers=headers)
-    try:
-        response.raise_for_status()
-    except requests.HTTPError as exc:  # noqa: PERF203
-        snippet = response.text[:500].replace("\n", " ")
-        raise RuntimeError(f"HTTP {response.status_code} from {url}: {snippet}") from exc
-    data = response.json()
-    try:
-        content = data["choices"][0]["message"]["content"]
-    except (KeyError, IndexError) as exc:
-        raise RuntimeError(f"Unexpected response format: {data}") from exc
-
-    return ensure_json_dict(content)
+    candidate_urls = ", ".join(
+        f"{base}/{'chat/completions' if mode == 'openai' else 'chat'}"
+        for mode, base in targets
+    )
+    detail = str(last_error) if last_error else "unknown error"
+    raise RuntimeError(
+        f"Failed to analyze after {max_retries} attempt(s). Tried: {candidate_urls}. Last error: {detail}"
+    )
 
 
 def ensure_json_dict(content: str) -> Dict[str, Any]:
@@ -1080,10 +1283,13 @@ def build_config_metadata(args: argparse.Namespace, prompt_source: str) -> Dict[
     """Build metadata dictionary from config for inclusion in requests and outputs."""
     metadata = {
         "endpoint": args.endpoint,
+        "api_format": args.api_format,
         "model": args.model,
         "justice_files_base_url": args.justice_files_base_url,
         "temperature": args.temperature,
         "max_parallel_requests": args.max_parallel_requests,
+        "max_retries": args.max_retries,
+        "retry_backoff": args.retry_backoff,
         "prompt_source": prompt_source,
     }
     if args.dataset_tag:
@@ -1405,6 +1611,10 @@ def main() -> None:
         sys.exit(f"Dataset metadata file not found: {args.dataset_metadata_file}")
     if args.max_parallel_requests < 1:
         sys.exit("--max-parallel-requests must be >= 1")
+    if args.max_retries < 1:
+        sys.exit("--max-retries must be >= 1")
+    if args.retry_backoff < 0:
+        sys.exit("--retry-backoff must be >= 0")
     if args.min_text_chars < 0:
         sys.exit("--min-text-chars must be >= 0")
     if args.min_text_words < 0:
@@ -1532,6 +1742,7 @@ def main() -> None:
     skipped = 0
     failed = 0
     model_scored = 0
+    interrupted = False
     executor = (
         concurrent.futures.ThreadPoolExecutor(max_workers=args.max_parallel_requests)
         if args.max_parallel_requests > 1
@@ -1661,12 +1872,15 @@ def main() -> None:
 
             request_kwargs = {
                 "endpoint": args.endpoint,
+                "api_format": args.api_format,
                 "model": args.model,
                 "filename": filename,
                 "text": text,
                 "system_prompt": system_prompt,
                 "api_key": args.api_key,
                 "timeout": args.timeout,
+                "max_retries": args.max_retries,
+                "retry_backoff": args.retry_backoff,
                 "temperature": args.temperature,
                 "reasoning_effort": args.reasoning_effort,
                 "config_metadata": config_metadata,
@@ -1696,12 +1910,15 @@ def main() -> None:
                 future = executor.submit(
                     call_model,
                     endpoint=args.endpoint,
+                    api_format=args.api_format,
                     model=args.model,
                     filename=filename,
                     text=text,
                     system_prompt=system_prompt,
                     api_key=args.api_key,
                     timeout=args.timeout,
+                    max_retries=args.max_retries,
+                    retry_backoff=args.retry_backoff,
                     temperature=args.temperature,
                     reasoning_effort=args.reasoning_effort,
                     config_metadata=config_metadata,
@@ -1716,9 +1933,23 @@ def main() -> None:
             harvest_completed(block=True)
 
         flush_ready()
+    except KeyboardInterrupt:
+        interrupted = True
+        print(
+            "\nPause requested (Ctrl+C). Flushing completed rows and preserving checkpoint state...",
+            file=sys.stderr,
+        )
+        harvest_completed(block=False)
+        flush_ready()
     finally:
         if executor:
-            executor.shutdown(wait=True)
+            if interrupted:
+                for future in list(in_flight.keys()):
+                    future.cancel()
+                in_flight.clear()
+                executor.shutdown(wait=False, cancel_futures=True)
+            else:
+                executor.shutdown(wait=True)
         if checkpoint_handle:
             checkpoint_handle.close()
         output_router.close()
@@ -1726,17 +1957,23 @@ def main() -> None:
     elapsed = time.monotonic() - start_time
     elapsed_hours = elapsed / 3600
     cost_summary = format_cost_summary(args.power_watts, args.electric_rate, elapsed_hours, args.run_hours)
+    status_verb = "Paused after" if interrupted else "Completed"
     if args.chunk_size > 0:
         complete_msg = (
-            f"Completed {processed} new rows in {format_duration(elapsed)} "
+            f"{status_verb} {processed} new rows in {format_duration(elapsed)} "
             f"({model_scored} modeled, {skipped} skipped, {failed} failed). "
             f"Chunks saved under {args.chunk_dir} | manifest: {args.chunk_manifest}"
         )
     else:
         complete_msg = (
-            f"Completed {processed} new rows in {format_duration(elapsed)} "
+            f"{status_verb} {processed} new rows in {format_duration(elapsed)} "
             f"({model_scored} modeled, {skipped} skipped, {failed} failed). "
             f"CSV saved to {args.output} | JSONL appended to {args.json_output}"
+        )
+    if interrupted:
+        complete_msg = (
+            f"{complete_msg}\nResume by re-running with --resume "
+            f"(checkpoint: {args.checkpoint})."
         )
     if cost_summary:
         complete_msg = f"{complete_msg}\n{cost_summary}"

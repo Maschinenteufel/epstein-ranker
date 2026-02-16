@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import gpt_ranker
 
@@ -203,6 +204,123 @@ class GptRankerHelpersTest(unittest.TestCase):
             payload = run_file.read_text(encoding="utf-8")
             self.assertIn("standardworks_epstein_files", payload)
             self.assertIn("dataset_profile", payload)
+
+    def test_build_request_targets_adds_localhost_fallback(self) -> None:
+        targets = gpt_ranker.build_request_targets(
+            "http://localhost:5002/v1",
+            "auto",
+        )
+        self.assertIn(("openai", "http://localhost:5002/v1"), targets)
+        self.assertIn(("chat", "http://localhost:5002/v1"), targets)
+        self.assertIn(("chat", "http://localhost:5555/api/v1"), targets)
+
+    def test_call_model_chat_mode_parses_output(self) -> None:
+        response_payload = {
+            "output": [
+                {
+                    "type": "message",
+                    "content": (
+                        '{"headline":"h","importance_score":1,"reason":"r",'
+                        '"key_insights":[],"tags":[],"power_mentions":[],'
+                        '"agency_involvement":[],"lead_types":[]}'
+                    ),
+                }
+            ]
+        }
+        with mock.patch.object(gpt_ranker, "post_request", return_value=response_payload) as mocked_post:
+            result = gpt_ranker.call_model(
+                endpoint="http://localhost:5555/api/v1",
+                api_format="chat",
+                model="qwen/qwen3-coder-next",
+                filename="DataSet10/EFTA00000001.txt",
+                text="Some useful text with enough detail for scoring.",
+                system_prompt="Return JSON",
+                api_key=None,
+                timeout=30,
+                max_retries=1,
+                retry_backoff=0,
+                temperature=0.0,
+                reasoning_effort=None,
+                config_metadata=None,
+            )
+        self.assertEqual(result["headline"], "h")
+        self.assertTrue(mocked_post.call_args.kwargs["url"].endswith("/chat"))
+
+    def test_call_model_auto_falls_back_to_chat_endpoint(self) -> None:
+        response_payload = {
+            "output": [
+                {
+                    "type": "message",
+                    "content": (
+                        '{"headline":"h","importance_score":1,"reason":"r",'
+                        '"key_insights":[],"tags":[],"power_mentions":[],'
+                        '"agency_involvement":[],"lead_types":[]}'
+                    ),
+                }
+            ]
+        }
+
+        def side_effect(*, url, payload, api_key, timeout):
+            if url.endswith("/chat/completions"):
+                raise gpt_ranker.UnsupportedEndpointError("no completions route")
+            return response_payload
+
+        with mock.patch.object(gpt_ranker, "post_request", side_effect=side_effect) as mocked_post:
+            result = gpt_ranker.call_model(
+                endpoint="http://localhost:1234/v1",
+                api_format="auto",
+                model="qwen/qwen3-coder-next",
+                filename="DataSet10/EFTA00000001.txt",
+                text="Some useful text with enough detail for scoring.",
+                system_prompt="Return JSON",
+                api_key=None,
+                timeout=30,
+                max_retries=1,
+                retry_backoff=0,
+                temperature=0.0,
+                reasoning_effort=None,
+                config_metadata=None,
+            )
+        self.assertEqual(result["importance_score"], 1)
+        called_urls = [call.kwargs["url"] for call in mocked_post.call_args_list]
+        self.assertIn("http://localhost:1234/v1/chat/completions", called_urls)
+        self.assertIn("http://localhost:1234/v1/chat", called_urls)
+
+    def test_call_model_retries_transient_errors(self) -> None:
+        response_payload = {
+            "output": [
+                {
+                    "type": "message",
+                    "content": (
+                        '{"headline":"h","importance_score":1,"reason":"r",'
+                        '"key_insights":[],"tags":[],"power_mentions":[],'
+                        '"agency_involvement":[],"lead_types":[]}'
+                    ),
+                }
+            ]
+        }
+        side_effects = [
+            gpt_ranker.ModelRequestError("temporary outage", retriable=True),
+            response_payload,
+        ]
+        with mock.patch.object(gpt_ranker, "post_request", side_effect=side_effects) as mocked_post:
+            result = gpt_ranker.call_model(
+                endpoint="http://localhost:5555/api/v1",
+                api_format="chat",
+                model="qwen/qwen3-coder-next",
+                filename="DataSet10/EFTA00000001.txt",
+                text="Some useful text with enough detail for scoring.",
+                system_prompt="Return JSON",
+                api_key=None,
+                timeout=30,
+                max_retries=2,
+                retry_backoff=0,
+                temperature=0.0,
+                reasoning_effort=None,
+                config_metadata=None,
+            )
+        self.assertEqual(result["headline"], "h")
+        self.assertEqual(mocked_post.call_count, 2)
 
 
 if __name__ == "__main__":

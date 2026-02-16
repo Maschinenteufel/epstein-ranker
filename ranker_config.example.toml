@@ -1,7 +1,8 @@
 # Sample configuration for gpt_ranker.py
 
 # Endpoint / model overrides
-endpoint = "http://localhost:5002/v1"
+endpoint = "http://localhost:5555/api/v1"
+api_format = "auto" # "auto", "openai", or "chat"
 model = "qwen/qwen3-coder-next"
 justice_files_base_url = "https://www.justice.gov/epstein/files"
 max_parallel_requests = 4
@@ -10,6 +11,8 @@ reasoning_effort = "low"  # Optional: "low", "medium", or "high" (omit if model 
 sleep = 0.5
 timeout = 1200.0  # HTTP request timeout in seconds (10 minutes)
                  # For very large documents (100K+ tokens), increase to 1200 (20 min) or higher
+max_retries = 3
+retry_backoff = 1.5
 
 # Low-signal skipping safeguards
 skip_low_quality = true
