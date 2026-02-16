@@ -388,6 +388,30 @@ def parse_args() -> argparse.Namespace:
         help="Vision detail hint passed to image_url blocks (lower detail reduces token usage).",
     )
     parser.add_argument(
+        "--image-output-format",
+        choices=["png", "jpeg"],
+        default="jpeg",
+        help="Output format for rendered/packed images before request upload.",
+    )
+    parser.add_argument(
+        "--image-jpeg-quality",
+        type=int,
+        default=75,
+        help="JPEG quality (1-95) when --image-output-format=jpeg.",
+    )
+    parser.add_argument(
+        "--image-max-side",
+        type=int,
+        default=1024,
+        help="If >0, downscale prepared images so the longest side is at most this many pixels.",
+    )
+    parser.add_argument(
+        "--debug-image-dir",
+        type=Path,
+        default=None,
+        help="Optional directory to save intermediate rendered/packed images and prep timing summaries.",
+    )
+    parser.add_argument(
         "--max-retries",
         type=int,
         default=3,

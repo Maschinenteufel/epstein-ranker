@@ -146,9 +146,84 @@ def image_path_to_data_url(image_path: Path) -> str:
     return f"data:{mime};base64,{encoded}"
 
 
+def encode_image_bytes_to_data_url(image_bytes: bytes, *, mime: str) -> str:
+    encoded = base64.b64encode(image_bytes).decode("ascii")
+    return f"data:{mime};base64,{encoded}"
+
+
 def encode_png_bytes_to_data_url(png_bytes: bytes) -> str:
-    encoded = base64.b64encode(png_bytes).decode("ascii")
-    return f"data:image/png;base64,{encoded}"
+    return encode_image_bytes_to_data_url(png_bytes, mime="image/png")
+
+
+def _sanitize_debug_stem(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._") or "image"
+
+
+def _get_pillow() -> Any:
+    try:
+        from PIL import Image  # type: ignore
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError(
+            "Image packing/compression requires Pillow. Install via: python -m pip install pillow"
+        ) from exc
+    return Image
+
+
+def _encode_raster_bytes(
+    image_bytes: bytes,
+    *,
+    output_format: str,
+    jpeg_quality: int,
+    image_max_side: int,
+) -> Tuple[str, Dict[str, Any]]:
+    normalized_format = output_format.lower()
+    if normalized_format not in {"png", "jpeg"}:
+        raise RuntimeError(f"Unsupported image output format: {output_format}")
+
+    # Fast path: keep existing PNG bytes untouched.
+    if normalized_format == "png" and image_max_side <= 0:
+        return (
+            encode_image_bytes_to_data_url(image_bytes, mime="image/png"),
+            {"bytes": len(image_bytes), "width": None, "height": None, "format": "png"},
+        )
+
+    Image = _get_pillow()
+    with Image.open(io.BytesIO(image_bytes)) as image:
+        raster = image.convert("RGB")
+        width, height = raster.size
+        if image_max_side > 0 and max(width, height) > image_max_side:
+            scale = image_max_side / float(max(width, height))
+            new_size = (
+                max(1, int(round(width * scale))),
+                max(1, int(round(height * scale))),
+            )
+            raster = raster.resize(new_size, Image.Resampling.LANCZOS)
+        out = io.BytesIO()
+        if normalized_format == "jpeg":
+            raster.save(
+                out,
+                format="JPEG",
+                quality=max(1, min(jpeg_quality, 95)),
+                optimize=True,
+                progressive=True,
+            )
+            mime = "image/jpeg"
+        else:
+            raster.save(out, format="PNG", optimize=True)
+            mime = "image/png"
+        final_width, final_height = raster.size
+        raster.close()
+        encoded_bytes = out.getvalue()
+    return (
+        encode_image_bytes_to_data_url(encoded_bytes, mime=mime),
+        {
+            "bytes": len(encoded_bytes),
+            "width": final_width,
+            "height": final_height,
+            "format": normalized_format,
+            "mime": mime,
+        },
+    )
 
 
 def render_pdf_page_to_png_bytes(pdf_path: Path, *, page_number: int, dpi: int) -> bytes:
@@ -204,21 +279,30 @@ def detect_pdf_page_count(pdf_path: Path) -> Optional[int]:
     return page_count if page_count > 0 else None
 
 
-def compose_png_pages_to_data_urls(
+def compose_png_pages(
     page_pngs: List[bytes],
     *,
     pages_per_image: int,
-) -> List[str]:
+) -> Tuple[List[bytes], List[Dict[str, Any]]]:
+    packed_images: List[bytes] = []
+    packed_meta: List[Dict[str, Any]] = []
     if pages_per_image <= 1:
-        return [encode_png_bytes_to_data_url(png) for png in page_pngs]
-    try:
-        from PIL import Image  # type: ignore
-    except ImportError as exc:  # pragma: no cover
-        raise RuntimeError(
-            "pdf page packing requires Pillow. Install via: python -m pip install pillow"
-        ) from exc
+        for idx, png in enumerate(page_pngs):
+            packed_meta.append(
+                {
+                    "block_index": idx + 1,
+                    "source_pages": [idx + 1],
+                    "bytes": len(png),
+                    "format": "png",
+                    "width": None,
+                    "height": None,
+                }
+            )
+            packed_images.append(png)
+        return packed_images, packed_meta
 
-    packed_urls: List[str] = []
+    Image = _get_pillow()
+
     for start in range(0, len(page_pngs), pages_per_image):
         chunk = page_pngs[start : start + pages_per_image]
         if not chunk:
@@ -242,8 +326,19 @@ def compose_png_pages_to_data_urls(
         output = io.BytesIO()
         canvas.save(output, format="PNG", optimize=True)
         canvas.close()
-        packed_urls.append(encode_png_bytes_to_data_url(output.getvalue()))
-    return packed_urls
+        encoded_bytes = output.getvalue()
+        packed_images.append(encoded_bytes)
+        packed_meta.append(
+            {
+                "block_index": len(packed_images),
+                "source_pages": list(range(start + 1, start + len(chunk) + 1)),
+                "bytes": len(encoded_bytes),
+                "format": "png",
+                "width": cols * cell_w,
+                "height": rows * cell_h,
+            }
+        )
+    return packed_images, packed_meta
 
 
 def prepare_image_data_urls(
@@ -253,9 +348,27 @@ def prepare_image_data_urls(
     render_dpi: int,
     pdf_pages_per_image: int = 1,
     start_page: int = 1,
+    image_output_format: str = "png",
+    image_jpeg_quality: int = 85,
+    image_max_side: int = 0,
+    debug_image_dir: Optional[Path] = None,
 ) -> Tuple[List[str], int, Optional[int]]:
     suffix = image_path.suffix.lower()
+    debug_dir: Optional[Path] = None
+    debug_render_dir: Optional[Path] = None
+    debug_packed_dir: Optional[Path] = None
+    if debug_image_dir is not None:
+        debug_stem = _sanitize_debug_stem(
+            f"{image_path.stem}_p{start_page:05d}_max{max_pages:03d}"
+        )
+        debug_dir = debug_image_dir / debug_stem
+        debug_render_dir = debug_dir / "rendered_pages"
+        debug_packed_dir = debug_dir / "packed_images"
+        debug_render_dir.mkdir(parents=True, exist_ok=True)
+        debug_packed_dir.mkdir(parents=True, exist_ok=True)
+
     if suffix == ".pdf":
+        total_start = time.monotonic()
         pdf_page_count = detect_pdf_page_count(image_path)
         first_page = max(1, start_page)
         if pdf_page_count is not None and first_page > pdf_page_count:
@@ -267,19 +380,106 @@ def prepare_image_data_urls(
             if pdf_page_count is not None
             else max_pages
         )
-        page_pngs = [
-            render_pdf_page_to_png_bytes(image_path, page_number=page_number, dpi=render_dpi)
-            for page_number in range(first_page, first_page + target_pages)
-        ]
+        render_start = time.monotonic()
+        page_pngs: List[bytes] = []
+        rendered_pages_meta: List[Dict[str, Any]] = []
+        for page_number in range(first_page, first_page + target_pages):
+            png_bytes = render_pdf_page_to_png_bytes(
+                image_path,
+                page_number=page_number,
+                dpi=render_dpi,
+            )
+            page_pngs.append(png_bytes)
+            rendered_pages_meta.append(
+                {"page_number": page_number, "raw_bytes": len(png_bytes)}
+            )
+            if debug_render_dir is not None:
+                debug_page_path = debug_render_dir / f"page_{page_number:05d}.png"
+                debug_page_path.write_bytes(png_bytes)
+        render_seconds = time.monotonic() - render_start
+
+        pack_start = time.monotonic()
+        packed_images, packed_meta = compose_png_pages(
+            page_pngs,
+            pages_per_image=max(1, pdf_pages_per_image),
+        )
+        final_urls: List[str] = []
+        final_meta: List[Dict[str, Any]] = []
+        for idx, packed_image in enumerate(packed_images):
+            final_url, meta = _encode_raster_bytes(
+                packed_image,
+                output_format=image_output_format,
+                jpeg_quality=image_jpeg_quality,
+                image_max_side=max(0, image_max_side),
+            )
+            final_urls.append(final_url)
+            merged_meta = dict(packed_meta[idx]) if idx < len(packed_meta) else {}
+            local_pages = merged_meta.get("source_pages")
+            absolute_pages: List[int] = []
+            if isinstance(local_pages, list):
+                for page_number in local_pages:
+                    if isinstance(page_number, int) and page_number > 0:
+                        absolute_pages.append(first_page + page_number - 1)
+            merged_meta.update(
+                {
+                    "final_bytes": meta.get("bytes"),
+                    "final_format": meta.get("format"),
+                    "final_width": meta.get("width"),
+                    "final_height": meta.get("height"),
+                    "source_pages_absolute": absolute_pages,
+                }
+            )
+            final_meta.append(merged_meta)
+            if debug_packed_dir is not None:
+                ext = ".jpg" if meta.get("format") == "jpeg" else ".png"
+                if absolute_pages:
+                    debug_packed_name = (
+                        f"block_{idx + 1:03d}_"
+                        f"p{absolute_pages[0]:05d}-{absolute_pages[-1]:05d}{ext}"
+                    )
+                else:
+                    debug_packed_name = f"block_{idx + 1:03d}{ext}"
+                debug_packed_path = debug_packed_dir / debug_packed_name
+                debug_packed_path.write_bytes(
+                    base64.b64decode(final_url.split(",", 1)[1].encode("ascii"))
+                )
+        pack_seconds = time.monotonic() - pack_start
+
+        if debug_dir is not None:
+            debug_summary = {
+                "image_path": str(image_path),
+                "start_page": first_page,
+                "target_pages": target_pages,
+                "pdf_total_pages": pdf_page_count,
+                "render_dpi": render_dpi,
+                "pages_per_image": max(1, pdf_pages_per_image),
+                "image_output_format": image_output_format,
+                "image_jpeg_quality": image_jpeg_quality,
+                "image_max_side": max(0, image_max_side),
+                "render_seconds": round(render_seconds, 4),
+                "pack_seconds": round(pack_seconds, 4),
+                "total_prepare_seconds": round(time.monotonic() - total_start, 4),
+                "rendered_pages": rendered_pages_meta,
+                "packed_blocks": final_meta,
+            }
+            (debug_dir / "summary.json").write_text(
+                json.dumps(debug_summary, indent=2),
+                encoding="utf-8",
+            )
         return (
-            compose_png_pages_to_data_urls(
-                page_pngs,
-                pages_per_image=max(1, pdf_pages_per_image),
-            ),
+            final_urls,
             target_pages,
             pdf_page_count,
         )
-    return [image_path_to_data_url(image_path)], 1, None
+
+    image_bytes = image_path.read_bytes()
+    url, _meta = _encode_raster_bytes(
+        image_bytes,
+        output_format=image_output_format,
+        jpeg_quality=image_jpeg_quality,
+        image_max_side=max(0, image_max_side),
+    )
+    return [url], 1, None
 
 
 def post_request(
@@ -413,6 +613,10 @@ def call_model(
     reasoning_effort: Optional[str],
     image_detail: str,
     pdf_pages_per_image: int = 1,
+    image_output_format: str = "png",
+    image_jpeg_quality: int = 85,
+    image_max_side: int = 0,
+    debug_image_dir: Optional[Path] = None,
     image_start_page: int = 1,
     image_part_index: Optional[int] = None,
     image_part_total: Optional[int] = None,
@@ -449,6 +653,10 @@ def call_model(
             max_pages=max(1, image_max_pages),
             render_dpi=max(72, image_render_dpi),
             pdf_pages_per_image=max(1, pdf_pages_per_image),
+            image_output_format=image_output_format,
+            image_jpeg_quality=max(1, min(image_jpeg_quality, 95)),
+            image_max_side=max(0, image_max_side),
+            debug_image_dir=debug_image_dir,
             start_page=max(1, image_start_page),
         )
         doc_input = build_image_analysis_instruction(

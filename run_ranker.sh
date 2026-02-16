@@ -41,12 +41,18 @@ MODEL_EXPLICIT=0
 ENDPOINT_EXPLICIT=0
 MAX_PARALLEL_REQUESTS=4
 PARALLEL_SCHEDULING="batch"
+PARALLEL_SCHEDULING_EXPLICIT=0
 IMAGE_PREFETCH=0
-IMAGE_MAX_PAGES=1
-PDF_PAGES_PER_IMAGE=1
-PDF_PART_PAGES=0
+IMAGE_PREFETCH_EXPLICIT=0
+IMAGE_MAX_PAGES=128
+PDF_PAGES_PER_IMAGE=4
+PDF_PART_PAGES=128
 IMAGE_RENDER_DPI=120
 IMAGE_DETAIL="low"
+IMAGE_OUTPUT_FORMAT="jpeg"
+IMAGE_JPEG_QUALITY=75
+IMAGE_MAX_SIDE=1024
+DEBUG_IMAGE_DIR=""
 MAX_OUTPUT_TOKENS=900
 TEMPERATURE=0.0
 SLEEP_SECONDS=0
@@ -56,6 +62,7 @@ MAX_ROWS=""
 RESUME=1
 SKIP_MISSING=1
 DRY_RUN=0
+KEEP_TEMP=0
 
 EXTRA_ARGS=()
 
@@ -90,11 +97,15 @@ Model/runtime options:
   --parallel N               Max parallel requests (default: 4)
   --parallel-scheduling MODE auto | window | batch (default: batch)
   --image-prefetch N         Extra queued image tasks beyond --parallel (default: 0)
-  --image-max-pages N        Max rendered PDF pages per document (default: 1)
-  --pdf-pages-per-image N    Pack N PDF pages into one tiled image block (default: 1)
-  --pdf-part-pages N         Split each PDF into N-page parts (default: 0 = disabled)
+  --image-max-pages N        Max rendered PDF pages per document (default: 128)
+  --pdf-pages-per-image N    Pack N PDF pages into one tiled image block (default: 4)
+  --pdf-part-pages N         Split each PDF into N-page parts (default: 128)
   --image-render-dpi N       PDF render DPI (default: 120)
   --image-detail MODE        auto | low | high (default: low)
+  --image-output-format FMT  png | jpeg (default: jpeg)
+  --image-jpeg-quality N     JPEG quality for prepared images (default: 75)
+  --image-max-side N         Downscale long side to this px (0 disables, default: 1024)
+  --debug-image-dir PATH     Save intermediate rendered/packed images + timing JSONs
   --max-output-tokens N      Max completion tokens per request (default: 900)
   --temperature FLOAT        Sampling temperature (default: 0.0)
   --sleep SECONDS            Delay between submissions (default: 0)
@@ -106,6 +117,7 @@ Control options:
   --no-resume                Start fresh per selected workspace/tag
   --skip-missing             Skip volumes not yet downloaded (default)
   --strict-missing           Exit if a requested volume directory is missing
+  --keep-temp                Keep temporary run directory (debugging only)
   --dry-run                  Print commands without running
   -h, --help                 Show this help
 
@@ -319,10 +331,12 @@ while [[ $# -gt 0 ]]; do
       ;;
     --parallel-scheduling)
       PARALLEL_SCHEDULING="$2"
+      PARALLEL_SCHEDULING_EXPLICIT=1
       shift 2
       ;;
     --image-prefetch)
       IMAGE_PREFETCH="$2"
+      IMAGE_PREFETCH_EXPLICIT=1
       shift 2
       ;;
     --image-max-pages)
@@ -343,6 +357,22 @@ while [[ $# -gt 0 ]]; do
       ;;
     --image-detail)
       IMAGE_DETAIL="$2"
+      shift 2
+      ;;
+    --image-output-format)
+      IMAGE_OUTPUT_FORMAT="$2"
+      shift 2
+      ;;
+    --image-jpeg-quality)
+      IMAGE_JPEG_QUALITY="$2"
+      shift 2
+      ;;
+    --image-max-side)
+      IMAGE_MAX_SIDE="$2"
+      shift 2
+      ;;
+    --debug-image-dir)
+      DEBUG_IMAGE_DIR="$2"
       shift 2
       ;;
     --max-output-tokens)
@@ -381,6 +411,10 @@ while [[ $# -gt 0 ]]; do
       SKIP_MISSING=0
       shift
       ;;
+    --keep-temp)
+      KEEP_TEMP=1
+      shift
+      ;;
     --dry-run)
       DRY_RUN=1
       shift
@@ -412,6 +446,20 @@ if [[ ! -d "$DATA_ROOT" ]]; then
   exit 1
 fi
 
+# Use a per-run temp directory and clean it by default to avoid disk buildup.
+TMP_ROOT="$WORKSPACE_ROOT/.tmp"
+mkdir -p "$TMP_ROOT"
+RUN_TMP_DIR="$(mktemp -d "$TMP_ROOT/ranker_tmp.XXXXXX")"
+export TMPDIR="$RUN_TMP_DIR"
+cleanup_temp() {
+  if (( KEEP_TEMP )); then
+    echo "Keeping temp dir: $RUN_TMP_DIR"
+    return
+  fi
+  rm -rf "$RUN_TMP_DIR" 2>/dev/null || true
+}
+trap cleanup_temp EXIT
+
 if [[ "$PROVIDER" == "openrouter" ]]; then
   API_FORMAT="openai"
   if (( ENDPOINT_EXPLICIT == 0 )); then
@@ -433,6 +481,14 @@ if [[ "$PROVIDER" == "openrouter" ]]; then
     echo "OpenRouter provider selected but no API key found." >&2
     echo "Use --openrouter-api-key, --api-key, or set OPENROUTER_API_KEY." >&2
     exit 1
+  fi
+
+  # Hosted inference benefits from keeping request slots full while preparing the next jobs.
+  if (( PARALLEL_SCHEDULING_EXPLICIT == 0 )); then
+    PARALLEL_SCHEDULING="window"
+  fi
+  if (( IMAGE_PREFETCH_EXPLICIT == 0 )); then
+    IMAGE_PREFETCH="$MAX_PARALLEL_REQUESTS"
   fi
 fi
 
@@ -488,11 +544,17 @@ for vol in "${VOLUMES[@]}"; do
     --pdf-part-pages "$PDF_PART_PAGES"
     --image-render-dpi "$IMAGE_RENDER_DPI"
     --image-detail "$IMAGE_DETAIL"
+    --image-output-format "$IMAGE_OUTPUT_FORMAT"
+    --image-jpeg-quality "$IMAGE_JPEG_QUALITY"
+    --image-max-side "$IMAGE_MAX_SIDE"
     --max-output-tokens "$MAX_OUTPUT_TOKENS"
     --temperature "$TEMPERATURE"
     --sleep "$SLEEP_SECONDS"
     --chunk-size "$CHUNK_SIZE"
   )
+  if [[ -n "$DEBUG_IMAGE_DIR" ]]; then
+    CMD+=(--debug-image-dir "$DEBUG_IMAGE_DIR")
+  fi
 
   if (( TRACK_CHUNKS_IN_GIT )); then
     CMD+=(--chunk-dir "$GIT_CHUNK_DIR" --chunk-manifest "$GIT_CHUNK_MANIFEST")

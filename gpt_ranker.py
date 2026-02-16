@@ -823,6 +823,10 @@ def build_config_metadata(args: argparse.Namespace, prompt_source: str) -> Dict[
         "pdf_part_pages": args.pdf_part_pages,
         "image_render_dpi": args.image_render_dpi,
         "image_detail": args.image_detail,
+        "image_output_format": args.image_output_format,
+        "image_jpeg_quality": args.image_jpeg_quality,
+        "image_max_side": args.image_max_side,
+        "debug_image_dir": str(args.debug_image_dir) if args.debug_image_dir else None,
         "prompt_source": prompt_source,
     }
     if args.dataset_tag:
@@ -1256,6 +1260,10 @@ def main() -> None:
         sys.exit("--pdf-part-pages must be >= 0")
     if args.image_render_dpi < 72:
         sys.exit("--image-render-dpi must be >= 72")
+    if args.image_jpeg_quality < 1 or args.image_jpeg_quality > 95:
+        sys.exit("--image-jpeg-quality must be between 1 and 95")
+    if args.image_max_side < 0:
+        sys.exit("--image-max-side must be >= 0")
     if args.max_output_tokens < 1:
         sys.exit("--max-output-tokens must be >= 1")
     if active_processing_mode == "image" and args.api_format == "chat":
@@ -1296,6 +1304,8 @@ def main() -> None:
     args.json_output.parent.mkdir(parents=True, exist_ok=True)
     if args.checkpoint:
         args.checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    if args.debug_image_dir:
+        args.debug_image_dir.mkdir(parents=True, exist_ok=True)
 
     if active_processing_mode == "image":
         if args.skip_low_quality:
@@ -1305,7 +1315,10 @@ def main() -> None:
             f"PDF pages per file: {args.image_max_pages} | "
             f"pages per image: {args.pdf_pages_per_image} | "
             f"split part pages: {args.pdf_part_pages if args.pdf_part_pages > 0 else 'disabled'} | "
-            f"render DPI: {args.image_render_dpi}",
+            f"render DPI: {args.image_render_dpi} | "
+            f"format: {args.image_output_format} | "
+            f"jpeg quality: {args.image_jpeg_quality} | "
+            f"max side: {args.image_max_side if args.image_max_side > 0 else 'disabled'}",
             flush=True,
         )
         if args.pdf_part_pages > 0:
@@ -1321,6 +1334,11 @@ def main() -> None:
         ):
             print(
                 f"WARNING: image mode is enabled but model '{args.model}' may be non-vision.",
+                flush=True,
+            )
+        if args.debug_image_dir:
+            print(
+                f"Image debug artifacts enabled: {args.debug_image_dir}",
                 flush=True,
             )
     else:
@@ -1637,6 +1655,10 @@ def main() -> None:
                 "image_path": source_path if input_kind == "image" else None,
                 "image_max_pages": effective_image_max_pages,
                 "pdf_pages_per_image": args.pdf_pages_per_image,
+                "image_output_format": args.image_output_format,
+                "image_jpeg_quality": args.image_jpeg_quality,
+                "image_max_side": args.image_max_side,
+                "debug_image_dir": args.debug_image_dir,
                 "image_start_page": int(row.get("part_start_page") or 1),
                 "image_part_index": (
                     int(row["part_index"]) if row.get("part_index") is not None else None
@@ -1693,6 +1715,10 @@ def main() -> None:
                     image_path=source_path if input_kind == "image" else None,
                     image_max_pages=effective_image_max_pages,
                     pdf_pages_per_image=args.pdf_pages_per_image,
+                    image_output_format=args.image_output_format,
+                    image_jpeg_quality=args.image_jpeg_quality,
+                    image_max_side=args.image_max_side,
+                    debug_image_dir=args.debug_image_dir,
                     image_start_page=int(row.get("part_start_page") or 1),
                     image_part_index=(
                         int(row["part_index"]) if row.get("part_index") is not None else None
