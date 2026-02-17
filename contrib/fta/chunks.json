@@ -1,8 +1,8 @@
 {
   "metadata": {
     "total_dataset_rows": "unknown",
-    "rows_processed": 47626,
-    "last_updated": "2026-02-17 04:17:46"
+    "rows_processed": 56244,
+    "last_updated": "2026-02-17 13:41:37"
   },
   "chunks": [
     {
@@ -304,6 +304,66 @@
       "end_row": 36000,
       "json": "contrib/fta/VOL00011/epstein_ranked_35001_36000.jsonl",
       "row_count": 1000
+    },
+    {
+      "start_row": 36001,
+      "end_row": 37000,
+      "json": "contrib/fta/VOL00011/epstein_ranked_36001_37000.jsonl",
+      "row_count": 994
+    },
+    {
+      "start_row": 37001,
+      "end_row": 38000,
+      "json": "contrib/fta/VOL00011/epstein_ranked_37001_38000.jsonl",
+      "row_count": 987
+    },
+    {
+      "start_row": 38001,
+      "end_row": 39000,
+      "json": "contrib/fta/VOL00011/epstein_ranked_38001_39000.jsonl",
+      "row_count": 973
+    },
+    {
+      "start_row": 39001,
+      "end_row": 40000,
+      "json": "contrib/fta/VOL00011/epstein_ranked_39001_40000.jsonl",
+      "row_count": 947
+    },
+    {
+      "start_row": 40001,
+      "end_row": 41000,
+      "json": "contrib/fta/VOL00011/epstein_ranked_40001_41000.jsonl",
+      "row_count": 863
+    },
+    {
+      "start_row": 41001,
+      "end_row": 42000,
+      "json": "contrib/fta/VOL00011/epstein_ranked_41001_42000.jsonl",
+      "row_count": 689
+    },
+    {
+      "start_row": 42001,
+      "end_row": 43000,
+      "json": "contrib/fta/VOL00011/epstein_ranked_42001_43000.jsonl",
+      "row_count": 761
+    },
+    {
+      "start_row": 43001,
+      "end_row": 44000,
+      "json": "contrib/fta/VOL00011/epstein_ranked_43001_44000.jsonl",
+      "row_count": 995
+    },
+    {
+      "start_row": 44001,
+      "end_row": 45000,
+      "json": "contrib/fta/VOL00011/epstein_ranked_44001_45000.jsonl",
+      "row_count": 1000
+    },
+    {
+      "start_row": 45001,
+      "end_row": 46000,
+      "json": "contrib/fta/VOL00011/epstein_ranked_45001_46000.jsonl",
+      "row_count": 409
     },
     {
       "start_row": 1,
