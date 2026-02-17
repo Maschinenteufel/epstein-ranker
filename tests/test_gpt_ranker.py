@@ -558,6 +558,49 @@ class GptRankerHelpersTest(unittest.TestCase):
         self.assertEqual(meta["usage"]["cache_read_tokens"], 200)
         self.assertAlmostEqual(meta["provider_reported_cost_usd"], 0.00123)
 
+    def test_call_model_openai_accepts_array_content_blocks(self) -> None:
+        response_payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": (
+                                    '{"headline":"h","importance_score":1,"reason":"r",'
+                                    '"key_insights":[],"tags":[],"power_mentions":[],'
+                                    '"agency_involvement":[],"lead_types":[]}'
+                                ),
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+        with mock.patch.object(gpt_ranker, "post_request", return_value=response_payload):
+            result = gpt_ranker.call_model(
+                endpoint="https://openrouter.ai/api/v1",
+                api_format="openai",
+                model="qwen/qwen3-vl-30b-a3b-instruct",
+                filename="DataSet3/EFTA00004066.pdf",
+                text="text",
+                input_kind="text",
+                image_path=None,
+                image_max_pages=1,
+                image_render_dpi=120,
+                system_prompt="Return JSON",
+                api_key="test-key",
+                timeout=30,
+                max_retries=1,
+                retry_backoff=0,
+                temperature=0.0,
+                max_output_tokens=256,
+                reasoning_effort=None,
+                image_detail="low",
+                config_metadata=None,
+            )
+        self.assertEqual(result["headline"], "h")
+
     def test_attach_request_usage_and_cost_estimates_from_prices(self) -> None:
         result = {
             "_request_meta": {
@@ -714,6 +757,53 @@ class GptRankerHelpersTest(unittest.TestCase):
             )
         self.assertEqual(result["headline"], "h")
         self.assertEqual(mocked_post.call_count, 2)
+
+    def test_call_model_retries_empty_messages_within_attempt(self) -> None:
+        empty = {
+            "output": [
+                {
+                    "type": "message",
+                    "content": "   ",
+                }
+            ]
+        }
+        valid = {
+            "output": [
+                {
+                    "type": "message",
+                    "content": (
+                        '{"headline":"h","importance_score":1,"reason":"r",'
+                        '"key_insights":[],"tags":[],"power_mentions":[],'
+                        '"agency_involvement":[],"lead_types":[]}'
+                    ),
+                }
+            ]
+        }
+        with mock.patch.object(gpt_ranker, "post_request", side_effect=[empty, empty, valid]) as mocked_post:
+            result = gpt_ranker.call_model(
+                endpoint="http://localhost:5555/api/v1",
+                api_format="chat",
+                model="qwen/qwen3-coder-next",
+                filename="DataSet10/EFTA00000001.txt",
+                text="Some useful text with enough detail for scoring.",
+                input_kind="text",
+                image_path=None,
+                image_max_pages=1,
+                image_render_dpi=180,
+                system_prompt="Return JSON",
+                api_key=None,
+                timeout=30,
+                max_retries=1,
+                retry_backoff=0,
+                temperature=0.0,
+                max_output_tokens=900,
+                reasoning_effort=None,
+                image_detail="low",
+                config_metadata=None,
+            )
+        self.assertEqual(result["headline"], "h")
+        self.assertEqual(mocked_post.call_count, 3)
+        self.assertEqual(result["_request_meta"]["request_attempt"], 3)
 
     def test_call_model_image_mode_rejects_chat_api(self) -> None:
         with self.assertRaises(RuntimeError):

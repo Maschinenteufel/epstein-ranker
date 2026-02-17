@@ -30,6 +30,10 @@ class ModelRequestError(RuntimeError):
         self.retriable = retriable
 
 
+def _is_empty_model_message_error(exc: Exception) -> bool:
+    return isinstance(exc, ValueError) and "empty message" in str(exc).lower()
+
+
 def build_text_analysis_input(filename: str, text: str) -> str:
     return (
         "Analyze the following document and respond with the JSON schema "
@@ -532,18 +536,37 @@ def post_request(
 
 def extract_openai_content(data: Dict[str, Any]) -> str:
     try:
-        content = data["choices"][0]["message"]["content"]
+        message = data["choices"][0]["message"]
     except (KeyError, IndexError, TypeError) as exc:
         raise ModelRequestError(
             f"Unexpected OpenAI response format: {data}",
             retriable=False,
         ) from exc
-    if not isinstance(content, str):
-        raise ModelRequestError(
-            f"Unexpected OpenAI response content type: {type(content)}",
-            retriable=False,
-        )
-    return content
+    content = message.get("content") if isinstance(message, dict) else None
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        text_parts: List[str] = []
+        for item in content:
+            if isinstance(item, str):
+                text_parts.append(item)
+                continue
+            if not isinstance(item, dict):
+                continue
+            for key in ("text", "content", "output_text"):
+                value = item.get(key)
+                if isinstance(value, str):
+                    text_parts.append(value)
+                    break
+        if text_parts:
+            return "\n".join(text_parts)
+        return ""
+    if content is None:
+        return ""
+    raise ModelRequestError(
+        f"Unexpected OpenAI response content type: {type(content)}",
+        retriable=False,
+    )
 
 
 def extract_chat_content(data: Dict[str, Any]) -> str:
@@ -859,139 +882,154 @@ def call_model(
         if isinstance(openrouter_provider, str) and openrouter_provider.strip()
         else None
     )
+    # Some providers intermittently return blank content while still returning HTTP 200.
+    # Give a couple of same-endpoint retries before consuming a full outer retry attempt.
+    max_empty_content_retries = 2
     for attempt in range(1, max_retries + 1):
         saw_retriable_error = False
         for mode, base_url in targets:
             try:
-                def send_request(*, url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-                    if request_semaphore is None:
-                        return post_request(
-                            url=url,
-                            payload=payload,
-                            api_key=api_key,
-                            extra_headers=extra_headers or None,
-                            timeout=timeout,
-                        )
-                    request_semaphore.acquire()
-                    try:
-                        return post_request(
-                            url=url,
-                            payload=payload,
-                            api_key=api_key,
-                            extra_headers=extra_headers or None,
-                            timeout=timeout,
-                        )
-                    finally:
-                        request_semaphore.release()
+                target_request_attempt = 0
+                while True:
+                    target_request_attempt += 1
 
-                if mode == "openai":
-                    user_content: Any
-                    if input_kind == "image":
-                        content_blocks: List[Dict[str, Any]] = [{"type": "text", "text": doc_input}]
-                        for image_url in image_urls:
-                            image_payload: Dict[str, Any] = {"url": image_url}
-                            if image_detail != "auto":
-                                image_payload["detail"] = image_detail
-                            content_blocks.append(
-                                {"type": "image_url", "image_url": image_payload}
+                    def send_request(*, url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+                        if request_semaphore is None:
+                            return post_request(
+                                url=url,
+                                payload=payload,
+                                api_key=api_key,
+                                extra_headers=extra_headers or None,
+                                timeout=timeout,
                             )
-                        user_content = content_blocks
-                    else:
-                        user_content = doc_input
-                    payload: Dict[str, Any] = {
-                        "model": model,
-                        "temperature": temperature,
-                        "max_tokens": max_output_tokens,
-                        "messages": [
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": user_content},
-                        ],
-                    }
-                    if reasoning_effort:
-                        payload["reasoning"] = {"effort": reasoning_effort}
-                    if config_metadata:
-                        payload["metadata"] = config_metadata
-                    provider_preferences: Optional[Dict[str, Any]] = None
-                    if "openrouter.ai" in base_url:
-                        provider_preferences = {}
-                        if normalized_openrouter_provider:
-                            provider_preferences["order"] = [normalized_openrouter_provider]
-                        if openrouter_allow_fallbacks is not None:
-                            provider_preferences["allow_fallbacks"] = bool(
-                                openrouter_allow_fallbacks
+                        request_semaphore.acquire()
+                        try:
+                            return post_request(
+                                url=url,
+                                payload=payload,
+                                api_key=api_key,
+                                extra_headers=extra_headers or None,
+                                timeout=timeout,
                             )
-                        if normalized_openrouter_provider and openrouter_allow_fallbacks is False:
-                            provider_preferences["only"] = [normalized_openrouter_provider]
-                        if not provider_preferences:
-                            provider_preferences = None
-                    if provider_preferences:
-                        payload["provider"] = provider_preferences
-                    request_started = time.monotonic()
-                    data = send_request(url=f"{base_url}/chat/completions", payload=payload)
-                    request_seconds = time.monotonic() - request_started
-                    usage, provider_reported_cost_usd = extract_response_usage(data)
-                    response_provider = (
-                        str(data.get("provider")).strip()
-                        if isinstance(data.get("provider"), str)
-                        else None
-                    )
-                    if (
-                        "openrouter.ai" in base_url
-                        and normalized_openrouter_provider
-                        and openrouter_allow_fallbacks is False
-                    ):
-                        if not response_provider:
-                            raise ModelRequestError(
-                                "OpenRouter strict provider mode requires a provider label in "
-                                "response, but none was returned.",
-                                retriable=False,
-                            )
-                        if not _provider_matches_expected(
-                            response_provider,
-                            normalized_openrouter_provider,
+                        finally:
+                            request_semaphore.release()
+
+                    if mode == "openai":
+                        user_content: Any
+                        if input_kind == "image":
+                            content_blocks: List[Dict[str, Any]] = [{"type": "text", "text": doc_input}]
+                            for image_url in image_urls:
+                                image_payload: Dict[str, Any] = {"url": image_url}
+                                if image_detail != "auto":
+                                    image_payload["detail"] = image_detail
+                                content_blocks.append(
+                                    {"type": "image_url", "image_url": image_payload}
+                                )
+                            user_content = content_blocks
+                        else:
+                            user_content = doc_input
+                        payload = {
+                            "model": model,
+                            "temperature": temperature,
+                            "max_tokens": max_output_tokens,
+                            "messages": [
+                                {"role": "system", "content": system_prompt},
+                                {"role": "user", "content": user_content},
+                            ],
+                        }
+                        if reasoning_effort:
+                            payload["reasoning"] = {"effort": reasoning_effort}
+                        if config_metadata:
+                            payload["metadata"] = config_metadata
+                        provider_preferences: Optional[Dict[str, Any]] = None
+                        if "openrouter.ai" in base_url:
+                            provider_preferences = {}
+                            if normalized_openrouter_provider:
+                                provider_preferences["order"] = [normalized_openrouter_provider]
+                            if openrouter_allow_fallbacks is not None:
+                                provider_preferences["allow_fallbacks"] = bool(
+                                    openrouter_allow_fallbacks
+                                )
+                            if normalized_openrouter_provider and openrouter_allow_fallbacks is False:
+                                provider_preferences["only"] = [normalized_openrouter_provider]
+                            if not provider_preferences:
+                                provider_preferences = None
+                        if provider_preferences:
+                            payload["provider"] = provider_preferences
+                        request_started = time.monotonic()
+                        data = send_request(url=f"{base_url}/chat/completions", payload=payload)
+                        request_seconds = time.monotonic() - request_started
+                        usage, provider_reported_cost_usd = extract_response_usage(data)
+                        response_provider = (
+                            str(data.get("provider")).strip()
+                            if isinstance(data.get("provider"), str)
+                            else None
+                        )
+                        if (
+                            "openrouter.ai" in base_url
+                            and normalized_openrouter_provider
+                            and openrouter_allow_fallbacks is False
                         ):
-                            raise ModelRequestError(
-                                "OpenRouter strict provider mismatch: expected "
-                                f"'{normalized_openrouter_provider}', got '{response_provider}'.",
-                                retriable=False,
-                            )
-                    content = extract_openai_content(data)
-                else:
-                    payload = {
-                        "model": model,
-                        "system_prompt": system_prompt,
-                        "input": doc_input,
-                    }
-                    provider_preferences = None
-                    response_provider = None
-                    request_started = time.monotonic()
-                    data = send_request(url=f"{base_url}/chat", payload=payload)
-                    request_seconds = time.monotonic() - request_started
-                    usage, provider_reported_cost_usd = extract_response_usage(data)
-                    content = extract_chat_content(data)
-                try:
-                    parsed = ensure_json_dict(content)
-                    parsed["_request_meta"] = {
-                        "mode": mode,
-                        "endpoint": base_url,
-                        "attempt": attempt,
-                        "request_seconds": round(request_seconds, 4),
-                        "prep_seconds": round(prep_seconds, 4) if prep_seconds is not None else None,
-                        "input_kind": input_kind,
-                        "image_blocks": len(image_urls) if input_kind == "image" else 0,
-                        "source_page_count": source_page_count,
-                        "source_total_pages": source_total_pages,
-                        "usage": usage,
-                        "provider_reported_cost_usd": provider_reported_cost_usd,
-                        "provider_preferences": provider_preferences,
-                        "provider": response_provider,
-                    }
-                    return parsed
-                except (json.JSONDecodeError, TypeError, ValueError) as exc:
-                    raise ModelRequestError(
-                        f"Invalid JSON model output from {base_url}: {exc}",
-                        retriable=True,
-                    ) from exc
+                            if not response_provider:
+                                raise ModelRequestError(
+                                    "OpenRouter strict provider mode requires a provider label in "
+                                    "response, but none was returned.",
+                                    retriable=False,
+                                )
+                            if not _provider_matches_expected(
+                                response_provider,
+                                normalized_openrouter_provider,
+                            ):
+                                raise ModelRequestError(
+                                    "OpenRouter strict provider mismatch: expected "
+                                    f"'{normalized_openrouter_provider}', got '{response_provider}'.",
+                                    retriable=False,
+                                )
+                        content = extract_openai_content(data)
+                    else:
+                        payload = {
+                            "model": model,
+                            "system_prompt": system_prompt,
+                            "input": doc_input,
+                        }
+                        provider_preferences = None
+                        response_provider = None
+                        request_started = time.monotonic()
+                        data = send_request(url=f"{base_url}/chat", payload=payload)
+                        request_seconds = time.monotonic() - request_started
+                        usage, provider_reported_cost_usd = extract_response_usage(data)
+                        content = extract_chat_content(data)
+                    try:
+                        parsed = ensure_json_dict(content)
+                        parsed["_request_meta"] = {
+                            "mode": mode,
+                            "endpoint": base_url,
+                            "attempt": attempt,
+                            "request_attempt": target_request_attempt,
+                            "request_seconds": round(request_seconds, 4),
+                            "prep_seconds": round(prep_seconds, 4) if prep_seconds is not None else None,
+                            "input_kind": input_kind,
+                            "image_blocks": len(image_urls) if input_kind == "image" else 0,
+                            "source_page_count": source_page_count,
+                            "source_total_pages": source_total_pages,
+                            "usage": usage,
+                            "provider_reported_cost_usd": provider_reported_cost_usd,
+                            "provider_preferences": provider_preferences,
+                            "provider": response_provider,
+                        }
+                        return parsed
+                    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                        if (
+                            _is_empty_model_message_error(exc)
+                            and target_request_attempt <= max_empty_content_retries
+                        ):
+                            time.sleep(min(1.0, max(0.05, retry_backoff * 0.25)))
+                            saw_retriable_error = True
+                            continue
+                        raise ModelRequestError(
+                            f"Invalid JSON model output from {base_url}: {exc}",
+                            retriable=True,
+                        ) from exc
             except UnsupportedEndpointError as exc:
                 last_error = exc
                 continue
