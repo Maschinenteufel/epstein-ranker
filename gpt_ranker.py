@@ -9,6 +9,7 @@ import csv
 import json
 import math
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -59,6 +60,26 @@ try:
     csv.field_size_limit(sys.maxsize)
 except OverflowError:
     csv.field_size_limit(2**31 - 1)
+
+AGENCY_LOOKUP_TERMS: Set[str] = {
+    canonical.lower().strip()
+    for canonical in AGENCY_CANONICAL_MAP
+}
+for _canonical, _synonyms in AGENCY_CANONICAL_MAP.items():
+    AGENCY_LOOKUP_TERMS.update(syn.lower().strip() for syn in _synonyms if isinstance(syn, str))
+AGENCY_LOOKUP_TERMS.update({"ntoc", "ntsc", "new york field office"})
+
+AGENCY_LABEL_HINT_RE = re.compile(
+    r"\b("
+    r"field office|office|department|agency|committee|bureau|division|unit|"
+    r"operations center|operation center|task force|police"
+    r")\b",
+    flags=re.IGNORECASE,
+)
+
+_PDF_GROUNDING_TEXT_CACHE: Dict[str, str] = {}
+_PDF_GROUNDING_TEXT_CACHE_ORDER: Deque[str] = deque()
+_PDF_GROUNDING_TEXT_CACHE_MAX = 256
 
 
 def call_model(**kwargs: Any) -> Dict[str, Any]:
@@ -557,6 +578,94 @@ def normalize_power_mentions(values: List[str]) -> List[str]:
             continue
         collapsed.append(value)
     return collapsed
+
+
+def _looks_like_agency_label(value: str, explicit_agency_terms: Set[str]) -> bool:
+    lookup = " ".join(value.strip().lower().split())
+    if not lookup:
+        return True
+    if lookup in explicit_agency_terms or lookup in AGENCY_LOOKUP_TERMS:
+        return True
+    if AGENCY_LABEL_HINT_RE.search(lookup):
+        return True
+    return False
+
+
+def _mention_supported_by_context(mention: str, support_text: str) -> bool:
+    lookup = " ".join(mention.strip().lower().split())
+    if not lookup:
+        return False
+    if lookup in support_text:
+        return True
+    tokens = _name_tokens(lookup)
+    if len(tokens) >= 2:
+        return tokens[0] in support_text and tokens[-1] in support_text
+    return len(tokens) == 1 and len(tokens[0]) >= 4 and tokens[0] in support_text
+
+
+def filter_power_mentions(
+    values: List[str],
+    *,
+    tags: List[str],
+    reason: str,
+    key_insights: List[str],
+    agency_involvement: List[str],
+    source_support_text: str = "",
+) -> List[str]:
+    normalized = normalize_power_mentions(values)
+    explicit_agencies = normalize_agencies(agency_involvement)
+    explicit_agency_terms = {value.lower().strip() for value in explicit_agencies if value}
+    support_parts = [reason or ""] + key_insights + tags
+    support_text = " ".join(part.lower() for part in support_parts if isinstance(part, str))
+
+    filtered: List[str] = []
+    seen: Set[str] = set()
+    for mention in normalized:
+        cleaned = " ".join(mention.strip().split())
+        if not cleaned:
+            continue
+        if _looks_like_agency_label(cleaned, explicit_agency_terms):
+            continue
+        if len(_name_tokens(cleaned)) < 2:
+            continue
+        # Recall-first policy: preserve person-like mentions even when source grounding
+        # is inconclusive (common for image-only or mixed image/text PDFs).
+        # We only hard-filter obvious non-person labels above.
+        if cleaned not in seen:
+            filtered.append(cleaned)
+            seen.add(cleaned)
+    return filtered
+
+
+def load_pdf_grounding_text(source_path: Optional[str]) -> str:
+    if not source_path:
+        return ""
+    normalized_path = str(source_path).strip()
+    if not normalized_path.lower().endswith(".pdf"):
+        return ""
+    cached = _PDF_GROUNDING_TEXT_CACHE.get(normalized_path)
+    if cached is not None:
+        return cached
+    try:
+        completed = subprocess.run(
+            ["pdftotext", "-layout", normalized_path, "-"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError):
+        extracted = ""
+    else:
+        extracted = " ".join((completed.stdout or "").lower().split()) if completed.returncode == 0 else ""
+
+    _PDF_GROUNDING_TEXT_CACHE[normalized_path] = extracted
+    _PDF_GROUNDING_TEXT_CACHE_ORDER.append(normalized_path)
+    while len(_PDF_GROUNDING_TEXT_CACHE_ORDER) > _PDF_GROUNDING_TEXT_CACHE_MAX:
+        oldest = _PDF_GROUNDING_TEXT_CACHE_ORDER.popleft()
+        _PDF_GROUNDING_TEXT_CACHE.pop(oldest, None)
+    return extracted
 
 
 def max_repeated_char_run(text: str) -> int:
@@ -1749,11 +1858,37 @@ def build_output_records(
     source_url = justice_source_url or local_source_url
     key_insights = normalize_text_list(ensure_list(result.get("key_insights")))
     tags = normalize_text_list(ensure_list(result.get("tags")))
-    power_mentions = normalize_power_mentions(ensure_list(result.get("power_mentions")))
     agency_involvement = normalize_agencies(
         normalize_text_list(ensure_list(result.get("agency_involvement")), strip_descriptor=True)
     )
     lead_types = normalize_lead_types(ensure_list(result.get("lead_types")))
+    raw_power_mentions = ensure_list(result.get("power_mentions"))
+    power_mentions = filter_power_mentions(
+        raw_power_mentions,
+        tags=tags,
+        reason=str(result.get("reason", "")),
+        key_insights=key_insights,
+        agency_involvement=agency_involvement,
+    )
+    raw_power_mentions_normalized = normalize_power_mentions(raw_power_mentions)
+    unresolved_person_mentions = [
+        mention
+        for mention in raw_power_mentions_normalized
+        if mention not in power_mentions
+        and not _looks_like_agency_label(mention, {agency.lower() for agency in agency_involvement})
+        and len(_name_tokens(mention)) >= 2
+    ]
+    if unresolved_person_mentions:
+        source_support_text = load_pdf_grounding_text(source_row.get("source_path"))
+        if source_support_text:
+            power_mentions = filter_power_mentions(
+                raw_power_mentions,
+                tags=tags,
+                reason=str(result.get("reason", "")),
+                key_insights=key_insights,
+                agency_involvement=agency_involvement,
+                source_support_text=source_support_text,
+            )
     action_items = (
         normalize_text_list(ensure_list(result.get("action_items")))
         if args.include_action_items

@@ -18,6 +18,18 @@ EXPLANATION QUALITY (MANDATORY)
 - Avoid filler phrasing like "contains relevant information" without specifics.
 - `key_insights` should be 4-8 focused bullets; each bullet should carry at least one concrete fact or evidentiary detail from the file.
 
+EXTRACTION PRIORITY (HIGHEST PRIORITY)
+- Prioritize completeness of `power_mentions`, `lead_types`, `agency_involvement`, and `tags` over prose polish.
+- Extract entities/categories first, then write `headline`, `reason`, and `key_insights`.
+- `power_mentions` MUST include every explicitly named person tied to allegations, events, logistics, evidence, or corroborating context in the document (primary and secondary names).
+- Do not omit a named individual because they seem minor, incidental, or mentioned only once.
+- Do not require direct accusation to include a name in `power_mentions`. Include named individuals mentioned as present, connected, witnessed, hosting/attending, or otherwise context-linked to alleged events.
+- If a person is mentioned in contextual/non-accusatory terms, still include them in `power_mentions` and describe their role neutrally in `reason`/`key_insights` (for example: "named as present" or "mentioned in connection with location/event").
+- `lead_types` must include all applicable categories from the controlled vocabulary, not just the strongest one.
+- `agency_involvement` must include every explicitly named agency from the controlled vocabulary.
+- `tags` must include core actors/topics: all `power_mentions`, all `agency_involvement`, and the main misconduct/lead themes.
+- Final self-check before output: if any explicit names/agencies/lead categories appear in `reason` or `key_insights` but not in arrays, add them.
+
 ENTITY STANDARDIZATION (MANDATORY)
 - De-duplicate aliases that refer to the same entity.
 - In `power_mentions`, use one canonical label per entity:

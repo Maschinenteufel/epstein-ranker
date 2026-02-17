@@ -243,6 +243,61 @@ class GptRankerHelpersTest(unittest.TestCase):
         normalized = gpt_ranker.normalize_power_mentions(mentions)
         self.assertEqual(normalized, ["Jeffrey Epstein"])
 
+    def test_filter_power_mentions_removes_agencies_and_keeps_person_names(self) -> None:
+        mentions = [
+            "Jeffrey Epstein",
+            "Prince Edward",
+            "Donald Trump",
+            "Tony Hawk",
+            "FBI",
+            "NTOC",
+            "New York Field Office",
+        ]
+        filtered = gpt_ranker.filter_power_mentions(
+            mentions,
+            tags=["Jeffrey Epstein", "Prince Edward", "Tony Hawk", "FBI"],
+            reason="Complainant states Prince Edward and Tony Hawk were present on Epstein's island.",
+            key_insights=["FBI memo alleges trafficking tied to Jeffrey Epstein."],
+            agency_involvement=["FBI", "NTOC", "New York Field Office"],
+            source_support_text="jeffrey epstein prince edward tony hawk island",
+        )
+        self.assertEqual(
+            filtered,
+            ["Jeffrey Epstein", "Prince Edward", "Donald Trump", "Tony Hawk"],
+        )
+
+    def test_filter_power_mentions_keeps_name_supported_by_tags(self) -> None:
+        filtered = gpt_ranker.filter_power_mentions(
+            ["Tony Hawk"],
+            tags=["Tony Hawk", "human trafficking"],
+            reason="",
+            key_insights=[],
+            agency_involvement=[],
+        )
+        self.assertEqual(filtered, ["Tony Hawk"])
+
+    def test_filter_power_mentions_uses_source_support_text(self) -> None:
+        filtered = gpt_ranker.filter_power_mentions(
+            ["Tony Hawk", "FBI"],
+            tags=["human trafficking"],
+            reason="Complainant says Prince Edward was present.",
+            key_insights=[],
+            agency_involvement=[],
+            source_support_text="when tony hawk got married on the island",
+        )
+        self.assertEqual(filtered, ["Tony Hawk"])
+
+    def test_filter_power_mentions_keeps_unverified_person_when_no_source_text(self) -> None:
+        filtered = gpt_ranker.filter_power_mentions(
+            ["Tony Hawk"],
+            tags=["human trafficking"],
+            reason="Complainant alleges trafficking on the island.",
+            key_insights=["Prince Edward is mentioned as present."],
+            agency_involvement=[],
+            source_support_text="",
+        )
+        self.assertEqual(filtered, ["Tony Hawk"])
+
     def test_derive_justice_pdf_url_from_dataset_path(self) -> None:
         filename = "DataSet10/IMAGES/0332/EFTA01970985.txt"
         url = gpt_ranker.derive_justice_pdf_url(filename)
