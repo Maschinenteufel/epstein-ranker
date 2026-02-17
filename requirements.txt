@@ -1,0 +1,4 @@
+# Dependencies for the Python ranking pipeline (gpt_ranker.py)
+requests>=2.31.0
+Pillow>=10.0.0
+tomli>=2.0.1; python_version < "3.11"
