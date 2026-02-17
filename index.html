@@ -213,34 +213,20 @@
       <details class="methodology-collapse">
         <summary>How the Importance Score Works</summary>
         <p>
-          Documents are analyzed locally through LM Studio using open-source Qwen-family models. The pipeline supports both OCR text and
-          image/PDF-first processing, then scores each item from 0 (no actionable lead) to 100 (critical lead).
+          Scoring uses an investigative triage prompt. Inputs can be OCR text or rendered page images, and outputs
+          follow a strict JSON schema consumed by this viewer.
         </p>
-        <details class="accordion" open>
-          <summary>Scoring criteria (click to toggle)</summary>
-          <ul>
-            <li><strong>Investigative usefulness:</strong> Are there concrete follow-ups such as names, transactions, or dates?</li>
-            <li><strong>Controversy &amp; sensitivity:</strong> Would confirmation trigger public scrutiny or legal risk?</li>
-            <li><strong>Novelty:</strong> Does this surface new information versus repeating well-known facts?</li>
-            <li><strong>Power linkage:</strong> Does the lead implicate heads of state, major financiers, intelligence services, or similar actors?</li>
-          </ul>
-          <p>Rows above ~70 typically warrant deeper review—they combine unusual claims with explicit power connections.</p>
-        </details>
-        <details class="accordion">
-          <summary>LLM prompt (full text)</summary>
-          <pre>
-You are an investigative triage model.
-Input can be OCR text or document page images.
-Use only explicit evidence in the input.
-Do not invent names, agencies, dates, or amounts.
-If unreadable/low-signal, score low and explain why.
-Return JSON only with exactly:
-headline, importance_score, reason, key_insights, tags,
-power_mentions, agency_involvement, lead_types.
-importance_score is an integer 0-100.
-Use conservative scoring when evidence is weak.
-          </pre>
-        </details>
+        <ul>
+          <li><strong>Evidence discipline:</strong> The model is instructed to use only explicit evidence in the file and avoid invented names, dates, agencies, locations, or relationships.</li>
+          <li><strong>Low-signal handling:</strong> Unreadable, decorative, duplicate, or otherwise weak-content pages are assigned low scores.</li>
+          <li><strong>Lead focus:</strong> Scores prioritize investigative value for concrete links between influential actors and misconduct, coercion, trafficking, financial flows, legal exposure, corruption, intelligence activity, or cover-up behavior.</li>
+          <li><strong>Entity normalization:</strong> Power mentions are canonicalized (aliases collapsed), and <code>agency_involvement</code> plus <code>lead_types</code> are constrained to controlled vocabularies.</li>
+          <li><strong>Output contract:</strong> Each record must return <code>headline</code>, <code>importance_score</code>, <code>reason</code>, <code>key_insights</code>, <code>tags</code>, <code>power_mentions</code>, <code>agency_involvement</code>, and <code>lead_types</code>.</li>
+        </ul>
+        <p>
+          The rubric is integer-based from 0 to 100. Practical interpretation: 0-20 low signal, 21-50 limited to
+          moderate leads, 51-70 strong leads, 71-85 high-impact leads, and 86-100 exceptional to blockbuster leads.
+        </p>
       </details>
     </section>
 
