@@ -712,6 +712,55 @@ class GptRankerHelpersTest(unittest.TestCase):
         self.assertEqual(result["headline"], "h")
         self.assertEqual(mocked_post.call_count, 2)
 
+    def test_call_model_uses_rate_limit_backoff_hint(self) -> None:
+        response_payload = {
+            "output": [
+                {
+                    "type": "message",
+                    "content": (
+                        '{"headline":"h","importance_score":1,"reason":"r",'
+                        '"key_insights":[],"tags":[],"power_mentions":[],'
+                        '"agency_involvement":[],"lead_types":[]}'
+                    ),
+                }
+            ]
+        }
+        rate_limit_error = gpt_ranker.ModelRequestError(
+            "rate limited",
+            retriable=True,
+            status_code=429,
+            retry_after_seconds=7.0,
+        )
+        with (
+            mock.patch.object(gpt_ranker, "post_request", side_effect=[rate_limit_error, response_payload]) as mocked_post,
+            mock.patch.object(gpt_ranker._model_client.time, "sleep") as mocked_sleep,
+            mock.patch.object(gpt_ranker._model_client.random, "uniform", return_value=0.0),
+        ):
+            result = gpt_ranker.call_model(
+                endpoint="https://example.com/api/v1",
+                api_format="chat",
+                model="qwen/qwen3-coder-next",
+                filename="DataSet10/EFTA00000001.txt",
+                text="Some useful text with enough detail for scoring.",
+                input_kind="text",
+                image_path=None,
+                image_max_pages=1,
+                image_render_dpi=180,
+                system_prompt="Return JSON",
+                api_key=None,
+                timeout=30,
+                max_retries=2,
+                retry_backoff=0.1,
+                temperature=0.0,
+                max_output_tokens=900,
+                reasoning_effort=None,
+                image_detail="low",
+                config_metadata=None,
+            )
+        self.assertEqual(result["headline"], "h")
+        self.assertEqual(mocked_post.call_count, 2)
+        self.assertGreaterEqual(mocked_sleep.call_args.args[0], 7.0)
+
     def test_call_model_retries_malformed_json_output(self) -> None:
         malformed = {
             "output": [

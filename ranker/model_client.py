@@ -5,11 +5,13 @@ import functools
 import io
 import json
 import math
+import random
 import re
 import subprocess
 import tempfile
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -25,13 +27,44 @@ class UnsupportedEndpointError(RuntimeError):
 class ModelRequestError(RuntimeError):
     """Raised for model request failures with retriable vs permanent classification."""
 
-    def __init__(self, message: str, *, retriable: bool) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        retriable: bool,
+        status_code: Optional[int] = None,
+        retry_after_seconds: Optional[float] = None,
+    ) -> None:
         super().__init__(message)
         self.retriable = retriable
+        self.status_code = status_code
+        self.retry_after_seconds = retry_after_seconds
 
 
 def _is_empty_model_message_error(exc: Exception) -> bool:
     return isinstance(exc, ValueError) and "empty message" in str(exc).lower()
+
+
+def _parse_retry_after_seconds(value: Optional[str]) -> Optional[float]:
+    if not value:
+        return None
+    raw = value.strip()
+    if not raw:
+        return None
+    try:
+        delay = float(raw)
+        if delay > 0:
+            return delay
+    except ValueError:
+        pass
+    try:
+        dt = datetime.strptime(raw, "%a, %d %b %Y %H:%M:%S GMT").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    delta = (dt - datetime.now(timezone.utc)).total_seconds()
+    if delta <= 0:
+        return None
+    return delta
 
 
 def build_text_analysis_input(filename: str, text: str) -> str:
@@ -515,6 +548,10 @@ def post_request(
         )
     if response.status_code >= 400:
         snippet = response.text[:500].replace("\n", " ")
+        retry_after_seconds = _parse_retry_after_seconds(response.headers.get("Retry-After"))
+        if response.status_code == 429 and retry_after_seconds is None:
+            # Providers often omit Retry-After; use a conservative cooldown.
+            retry_after_seconds = 20.0
         retriable = (
             response.status_code in RETRIABLE_HTTP_STATUS_CODES
             or 500 <= response.status_code < 600
@@ -522,6 +559,8 @@ def post_request(
         raise ModelRequestError(
             f"HTTP {response.status_code} from {url}: {snippet}",
             retriable=retriable,
+            status_code=response.status_code,
+            retry_after_seconds=retry_after_seconds,
         )
 
     try:
@@ -887,6 +926,7 @@ def call_model(
     max_empty_content_retries = 2
     for attempt in range(1, max_retries + 1):
         saw_retriable_error = False
+        rate_limit_wait_seconds = 0.0
         for mode, base_url in targets:
             try:
                 target_request_attempt = 0
@@ -1036,10 +1076,22 @@ def call_model(
             except ModelRequestError as exc:
                 last_error = exc
                 saw_retriable_error = saw_retriable_error or exc.retriable
+                if exc.status_code == 429:
+                    suggested_wait = (
+                        exc.retry_after_seconds
+                        if isinstance(exc.retry_after_seconds, (int, float)) and exc.retry_after_seconds > 0
+                        else 20.0
+                    )
+                    # Add slight jitter to avoid synchronized retry bursts when many workers
+                    # are throttled at once.
+                    suggested_wait += random.uniform(0.0, 1.5)
+                    rate_limit_wait_seconds = max(rate_limit_wait_seconds, suggested_wait)
                 continue
 
         if attempt < max_retries and saw_retriable_error:
             sleep_seconds = retry_backoff * (2 ** (attempt - 1))
+            if rate_limit_wait_seconds > 0:
+                sleep_seconds = max(sleep_seconds, rate_limit_wait_seconds)
             time.sleep(max(0.0, sleep_seconds))
             continue
         break
