@@ -83,6 +83,94 @@ def infer_row_input_kind(file_path: Path, processing_mode: str) -> Optional[str]
     return None
 
 
+class PdfPageCountCache:
+    """Persistent cache for PDF page counts across runs."""
+
+    def __init__(self, path: Optional[Path]) -> None:
+        self.path = path
+        self._loaded = False
+        self._dirty = False
+        self._entries: Dict[str, Dict[str, Any]] = {}
+
+    def _cache_key(self, pdf_path: Path) -> str:
+        try:
+            return str(pdf_path.resolve().as_posix())
+        except OSError:
+            return str(pdf_path.as_posix())
+
+    def _load(self) -> None:
+        if self._loaded:
+            return
+        self._loaded = True
+        if not self.path or not self.path.exists():
+            return
+        try:
+            with self.path.open(encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            return
+        if isinstance(data, dict) and isinstance(data.get("entries"), dict):
+            entries = data["entries"]
+        elif isinstance(data, dict):
+            # Backward compatibility: accept a flat dict.
+            entries = data
+        else:
+            return
+        for key, value in entries.items():
+            if not isinstance(key, str) or not isinstance(value, dict):
+                continue
+            size = value.get("size")
+            mtime_ns = value.get("mtime_ns")
+            pages = value.get("pages")
+            if not isinstance(size, int) or size < 0:
+                continue
+            if not isinstance(mtime_ns, int) or mtime_ns < 0:
+                continue
+            if pages is not None and (not isinstance(pages, int) or pages <= 0):
+                pages = None
+            self._entries[key] = {
+                "size": size,
+                "mtime_ns": mtime_ns,
+                "pages": pages,
+            }
+
+    def get_page_count(self, pdf_path: Path) -> Optional[int]:
+        self._load()
+        try:
+            stat = pdf_path.stat()
+        except OSError:
+            return detect_pdf_page_count(pdf_path)
+        key = self._cache_key(pdf_path)
+        entry = self._entries.get(key)
+        if entry and entry.get("size") == stat.st_size and entry.get("mtime_ns") == stat.st_mtime_ns:
+            pages = entry.get("pages")
+            return pages if isinstance(pages, int) and pages > 0 else None
+
+        pages = detect_pdf_page_count(pdf_path)
+        self._entries[key] = {
+            "size": int(stat.st_size),
+            "mtime_ns": int(stat.st_mtime_ns),
+            "pages": pages if isinstance(pages, int) and pages > 0 else None,
+        }
+        self._dirty = True
+        return pages
+
+    def flush(self) -> None:
+        if not self.path or not self._dirty:
+            return
+        payload = {
+            "version": 1,
+            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "entries": self._entries,
+        }
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
+        with tmp_path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+        tmp_path.replace(self.path)
+        self._dirty = False
+
+
 def iter_rows(
     path: Path,
     *,
@@ -90,6 +178,7 @@ def iter_rows(
     include_text: bool = True,
     processing_mode: str = "auto",
     pdf_part_pages: int = 0,
+    pdf_page_count_cache: Optional[PdfPageCountCache] = None,
 ) -> Iterable[Dict[str, Any]]:
     if path.is_dir():
         for file_path in sorted(path.rglob(input_glob)):
@@ -104,7 +193,11 @@ def iter_rows(
                 and file_path.suffix.lower() == ".pdf"
                 and pdf_part_pages > 0
             ):
-                total_pages = detect_pdf_page_count(file_path)
+                total_pages = (
+                    pdf_page_count_cache.get_page_count(file_path)
+                    if pdf_page_count_cache is not None
+                    else detect_pdf_page_count(file_path)
+                )
                 if total_pages is not None and total_pages > pdf_part_pages:
                     total_parts = max(1, math.ceil(total_pages / pdf_part_pages))
                     for part_index in range(1, total_parts + 1):
@@ -256,29 +349,34 @@ def load_chunk_source_ids(chunk_dir: Path) -> Set[str]:
 
 def load_resume_completed_ids(args: argparse.Namespace) -> Set[str]:
     completed_source_ids: Set[str] = set()
-    output_backed_ids: Set[str] = set()
-
-    checkpoint_ids: Set[str] = set()
     if args.resume:
         checkpoint_ids = load_checkpoint(args.checkpoint)
-        output_backed_ids |= load_jsonl_filenames(args.json_output)
-        if args.chunk_size > 0:
-            output_backed_ids |= load_chunk_source_ids(args.chunk_dir)
         if checkpoint_ids:
-            if not output_backed_ids:
+            completed_source_ids |= checkpoint_ids
+        else:
+            # Compatibility path for legacy runs that have outputs but no checkpoint.
+            output_backed_ids: Set[str] = set()
+            output_backed_ids |= load_jsonl_filenames(args.json_output)
+            if args.chunk_size > 0:
+                output_backed_ids |= load_chunk_source_ids(args.chunk_dir)
+            if output_backed_ids:
+                completed_source_ids |= output_backed_ids
                 print(
-                    "Resume checkpoint exists but no output records were found; "
-                    "ignoring checkpoint entries so rows can be reprocessed.",
+                    "Resume checkpoint missing/empty; bootstrapped processed IDs from outputs. "
+                    "Future resumes will use the checkpoint for faster startup.",
                     flush=True,
                 )
+                if args.checkpoint:
+                    args.checkpoint.parent.mkdir(parents=True, exist_ok=True)
+                    with args.checkpoint.open("a", encoding="utf-8") as handle:
+                        for source_id in sorted(output_backed_ids):
+                            handle.write(source_id + "\n")
             else:
-                stale_checkpoint_ids = len(checkpoint_ids - output_backed_ids)
-                if stale_checkpoint_ids > 0:
-                    print(
-                        f"Ignoring {stale_checkpoint_ids} checkpoint-only ids not present in output records.",
-                        flush=True,
-                    )
-        completed_source_ids |= output_backed_ids
+                print(
+                    "Resume checkpoint missing/empty and no prior outputs found; "
+                    "starting from the beginning.",
+                    flush=True,
+                )
 
     for extra_json in args.known_json:
         completed_source_ids |= load_jsonl_filenames(Path(extra_json))
@@ -646,6 +744,7 @@ def count_total_rows(
     processing_mode: str = "auto",
     pdf_part_pages: int = 0,
     progress_label: Optional[str] = None,
+    pdf_page_count_cache: Optional[PdfPageCountCache] = None,
 ) -> int:
     """Count total number of source rows for CSV or directory input."""
     last_progress_at = time.monotonic()
@@ -669,6 +768,7 @@ def count_total_rows(
                 include_text=False,
                 processing_mode=processing_mode,
                 pdf_part_pages=pdf_part_pages,
+                pdf_page_count_cache=pdf_page_count_cache,
             ),
             start=1,
         ):
@@ -694,6 +794,7 @@ def calculate_workload(
     start_row: int,
     end_row: Optional[int],
     progress_label: Optional[str] = None,
+    pdf_page_count_cache: Optional[PdfPageCountCache] = None,
 ) -> Dict[str, int]:
     total = 0
     already_done = 0
@@ -708,6 +809,7 @@ def calculate_workload(
             include_text=False,
             processing_mode=processing_mode,
             pdf_part_pages=pdf_part_pages,
+            pdf_page_count_cache=pdf_page_count_cache,
         ),
         start=1,
     ):
@@ -753,6 +855,7 @@ def estimate_workload_fast(
     end_row: Optional[int],
     max_rows: Optional[int],
     sample_size: int,
+    pdf_page_count_cache: Optional[PdfPageCountCache] = None,
 ) -> Optional[Dict[str, Any]]:
     if not path.is_dir():
         return None
@@ -799,7 +902,11 @@ def estimate_workload_fast(
         sampled_parts: List[int] = []
         sampled_pages: List[int] = []
         for pdf_path in sampled_pdf_paths:
-            total_pages = detect_pdf_page_count(pdf_path)
+            total_pages = (
+                pdf_page_count_cache.get_page_count(pdf_path)
+                if pdf_page_count_cache is not None
+                else detect_pdf_page_count(pdf_path)
+            )
             if total_pages is None or total_pages <= 0:
                 continue
             sampled_pdf_count += 1
@@ -1163,8 +1270,28 @@ class OutputRouter:
         self.chunk_dir: Path = self.args.chunk_dir
         self.chunk_dir.mkdir(parents=True, exist_ok=True)
         self.chunk_manifest: Path = self.args.chunk_manifest
+        self._loaded_manifest_rows_processed: Optional[int] = None
         self.manifest_entries = self._load_manifest()
         self.manifest_dirty = False
+        self.rows_processed_total = (
+            self._loaded_manifest_rows_processed
+            if isinstance(self._loaded_manifest_rows_processed, int)
+            and self._loaded_manifest_rows_processed >= 0
+            else 0
+        )
+        if self._loaded_manifest_rows_processed is None and self.manifest_entries:
+            rebuilt_total = 0
+            for key, entry in self.manifest_entries.items():
+                row_count = entry.get("row_count")
+                if not isinstance(row_count, int) or row_count < 0:
+                    chunk_path = Path(str(entry.get("json", "")))
+                    row_count = self._count_lines(chunk_path)
+                    entry["row_count"] = row_count
+                    self.manifest_entries[key] = entry
+                    self.manifest_dirty = True
+                rebuilt_total += row_count
+            self.rows_processed_total = rebuilt_total
+        self.current_chunk_row_count = 0
         self.total_dataset_rows = None  # Will be set by main()
 
     def _load_manifest(self) -> Dict[Tuple[int, int], Dict[str, Any]]:
@@ -1177,14 +1304,19 @@ class OutputRouter:
             return {}
 
         # Handle both old format (array) and new format (object with chunks)
+        metadata = {}
         if isinstance(data, list):
             # Old format: array of chunks
             chunk_list = data
         elif isinstance(data, dict) and "chunks" in data:
             # New format: object with metadata and chunks
             chunk_list = data["chunks"]
+            metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
         else:
             return {}
+        rows_processed = metadata.get("rows_processed")
+        if isinstance(rows_processed, int) and rows_processed >= 0:
+            self._loaded_manifest_rows_processed = rows_processed
 
         entries: Dict[Tuple[int, int], Dict[str, Any]] = {}
         for entry in chunk_list:
@@ -1193,6 +1325,12 @@ class OutputRouter:
                 continue
             entries[key] = entry
         return entries
+
+    def _count_lines(self, path: Path) -> int:
+        if not path.exists():
+            return 0
+        with path.open(encoding="utf-8") as handle:
+            return sum(1 for _ in handle)
 
     def write(self, row_idx: int, csv_row: Dict[str, Any], json_record: Dict[str, Any]) -> None:
         if self.mode == "single":
@@ -1206,6 +1344,8 @@ class OutputRouter:
         self._ensure_chunk(chunk_bounds)
         self.json_handle.write(json.dumps(json_record, ensure_ascii=False) + "\n")
         self.json_handle.flush()
+        self.current_chunk_row_count += 1
+        self.rows_processed_total += 1
 
     def _chunk_bounds(self, row_idx: int) -> Tuple[int, int]:
         chunk_start = ((row_idx - 1) // self.chunk_size) * self.chunk_size + 1
@@ -1228,6 +1368,19 @@ class OutputRouter:
                 f"Chunk JSON {json_path} exists. Use --resume or --overwrite-output."
             )
         json_mode = "a" if self.args.resume and json_exists else "w"
+        existing_entry = self.manifest_entries.get(chunk_bounds)
+        existing_row_count = (
+            existing_entry.get("row_count")
+            if isinstance(existing_entry, dict)
+            else None
+        )
+        if not isinstance(existing_row_count, int) or existing_row_count < 0:
+            existing_row_count = self._count_lines(json_path) if json_exists else 0
+        if json_mode == "w" and json_exists:
+            self.rows_processed_total = max(0, self.rows_processed_total - existing_row_count)
+            self.manifest_entries.pop(chunk_bounds, None)
+            existing_row_count = 0
+        self.current_chunk_row_count = existing_row_count
         self.json_handle = json_path.open(json_mode, encoding="utf-8")
         self.current_json_path = json_path
 
@@ -1241,6 +1394,7 @@ class OutputRouter:
                 "start_row": chunk_start,
                 "end_row": chunk_end,
                 "json": str(self.current_json_path.as_posix()),
+                "row_count": self.current_chunk_row_count,
             }
             self.manifest_entries[self.current_chunk] = entry
             self.manifest_dirty = True
@@ -1248,6 +1402,7 @@ class OutputRouter:
             self._write_manifest()
         self.current_chunk = None
         self.current_json_path = None
+        self.current_chunk_row_count = 0
 
     def _write_manifest(self) -> None:
         """Write the manifest file to disk."""
@@ -1255,20 +1410,11 @@ class OutputRouter:
             return
         entries = sorted(self.manifest_entries.values(), key=lambda e: e["start_row"])
 
-        # Calculate total rows processed
-        total_processed = 0
-        for entry in entries:
-            # Count actual lines in the chunk file
-            chunk_path = Path(entry["json"])
-            if chunk_path.exists():
-                with chunk_path.open(encoding="utf-8") as f:
-                    total_processed += sum(1 for _ in f)
-
         # Build manifest with metadata
         manifest = {
             "metadata": {
                 "total_dataset_rows": self.total_dataset_rows if self.total_dataset_rows else "unknown",
-                "rows_processed": total_processed,
+                "rows_processed": max(0, int(self.rows_processed_total)),
                 "last_updated": time.strftime("%Y-%m-%d %H:%M:%S"),
             },
             "chunks": entries
@@ -1518,7 +1664,11 @@ def rebuild_manifest(chunk_dir: Path, manifest_path: Path) -> None:
         chunk_path = Path(chunk["json"])
         if chunk_path.exists():
             with chunk_path.open(encoding="utf-8") as f:
-                total_processed += sum(1 for _ in f)
+                row_count = sum(1 for _ in f)
+        else:
+            row_count = 0
+        chunk["row_count"] = row_count
+        total_processed += row_count
 
     # Try to get total dataset rows from the source CSV
     # Look for common CSV filenames in data/ directory
@@ -1951,6 +2101,12 @@ def main() -> None:
     completed_source_ids: Set[str] = load_resume_completed_ids(args)
     if completed_source_ids:
         print(f"Skipping {len(completed_source_ids)} pre-processed source ids.")
+    pdf_page_count_cache: Optional[PdfPageCountCache] = None
+    if active_processing_mode == "image" and args.input.is_dir():
+        cache_path = args.checkpoint.parent / ".pdf_page_counts.json"
+        pdf_page_count_cache = PdfPageCountCache(cache_path)
+        if args.pdf_part_pages > 0:
+            print(f"PDF page-count cache: {cache_path}", flush=True)
 
     workload_scan_mode = args.workload_scan
     if workload_scan_mode == "auto":
@@ -1984,6 +2140,7 @@ def main() -> None:
             start_row=args.start_row,
             end_row=args.end_row,
             progress_label=workload_progress_label,
+            pdf_page_count_cache=pdf_page_count_cache,
         )
         total_candidates = workload_stats["total"]
         already_done = workload_stats["already_done"] if args.resume else 0
@@ -2007,6 +2164,7 @@ def main() -> None:
             end_row=args.end_row,
             max_rows=args.max_rows,
             sample_size=args.workload_estimate_sample_size,
+            pdf_page_count_cache=pdf_page_count_cache,
         )
         if estimated_stats:
             target_total = int(estimated_stats["estimated_workload"])
@@ -2085,6 +2243,7 @@ def main() -> None:
                 if active_processing_mode == "image" and args.input.is_dir()
                 else None
             ),
+            pdf_page_count_cache=pdf_page_count_cache,
         )
         total_dataset_rows = output_router.total_dataset_rows
         print(f"Total dataset: {output_router.total_dataset_rows:,} rows")
@@ -2106,6 +2265,7 @@ def main() -> None:
                 if active_processing_mode == "image" and args.input.is_dir()
                 else None
             ),
+            pdf_page_count_cache=pdf_page_count_cache,
         )
 
     checkpoint_handle = (
@@ -2306,6 +2466,28 @@ def main() -> None:
                 }
         flush_ready()
 
+    resume_skipped_rows = 0
+    resume_skipped_rows_reported = 0
+    resume_skip_last_idx = 0
+    resume_skip_last_report_at = time.monotonic()
+
+    def report_resume_skip_progress(*, force: bool = False) -> None:
+        nonlocal resume_skipped_rows, resume_skipped_rows_reported
+        nonlocal resume_skip_last_idx, resume_skip_last_report_at
+        if resume_skipped_rows <= resume_skipped_rows_reported:
+            return
+        newly_skipped = resume_skipped_rows - resume_skipped_rows_reported
+        now = time.monotonic()
+        if not force and newly_skipped < 200 and (now - resume_skip_last_report_at) < 5:
+            return
+        print(
+            f"[resume] skipped {resume_skipped_rows:,} already-processed row(s) "
+            f"(latest row {resume_skip_last_idx:,}).",
+            flush=True,
+        )
+        resume_skipped_rows_reported = resume_skipped_rows
+        resume_skip_last_report_at = now
+
     try:
         for idx, row in enumerate(
             iter_rows(
@@ -2314,6 +2496,7 @@ def main() -> None:
                 include_text=True,
                 processing_mode=active_processing_mode,
                 pdf_part_pages=args.pdf_part_pages,
+                pdf_page_count_cache=pdf_page_count_cache,
             ),
             start=1,
         ):
@@ -2331,9 +2514,12 @@ def main() -> None:
             source_path = Path(row["source_path"]) if row.get("source_path") else None
 
             if source_id in completed_source_ids:
-                print(f"[Row {idx}] [skip] {source_id} already processed.", flush=True)
+                resume_skipped_rows += 1
+                resume_skip_last_idx = idx
+                report_resume_skip_progress(force=False)
                 continue
 
+            report_resume_skip_progress(force=True)
             scheduled += 1
             emit_order.append(idx)
 
@@ -2539,6 +2725,7 @@ def main() -> None:
             if args.sleep:
                 time.sleep(args.sleep)
 
+        report_resume_skip_progress(force=True)
         while in_flight:
             harvest_completed(block=True, wait_for_all=(parallel_scheduling == "batch"))
 
@@ -2563,6 +2750,8 @@ def main() -> None:
         if checkpoint_handle:
             checkpoint_handle.close()
         output_router.close()
+        if pdf_page_count_cache is not None:
+            pdf_page_count_cache.flush()
 
     elapsed = time.monotonic() - start_time
     elapsed_hours = elapsed / 3600

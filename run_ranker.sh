@@ -157,35 +157,92 @@ rebuild_git_manifest() {
   "$PYTHON_BIN" - "$GIT_OUTPUT_ROOT" <<'PY'
 from __future__ import annotations
 
-import glob
 import json
-import os
 import re
 import sys
 import time
 from pathlib import Path
 
 root = Path(sys.argv[1])
-pattern = str(root / "VOL*" / "epstein_ranked_*.jsonl")
 chunks = []
 rows_processed = 0
 
-for path in sorted(glob.glob(pattern)):
-    name = os.path.basename(path)
-    match = re.match(r"epstein_ranked_(\d+)_(\d+)\.jsonl$", name)
-    if not match:
+chunk_pattern = re.compile(r"epstein_ranked_(\d+)_(\d+)\.jsonl$")
+
+for vol_dir in sorted(root.glob("VOL*")):
+    if not vol_dir.is_dir():
         continue
-    start = int(match.group(1))
-    end = int(match.group(2))
-    rel = Path(path).as_posix()
-    if rel.startswith("./"):
-        rel = rel[2:]
-    chunks.append({"start_row": start, "end_row": end, "json": rel})
-    try:
-        with open(path, "r", encoding="utf-8") as handle:
-            rows_processed += sum(1 for _ in handle)
-    except OSError:
-        pass
+
+    volume_chunks = []
+    volume_rows_processed = None
+    volume_manifest = vol_dir / "chunks.json"
+    loaded_from_manifest = False
+
+    if volume_manifest.exists():
+        try:
+            with volume_manifest.open(encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            payload = None
+
+        if isinstance(payload, dict):
+            metadata = payload.get("metadata")
+            rows = metadata.get("rows_processed") if isinstance(metadata, dict) else None
+            if isinstance(rows, int) and rows >= 0:
+                volume_rows_processed = rows
+            raw_chunks = payload.get("chunks")
+            if isinstance(raw_chunks, list):
+                for entry in raw_chunks:
+                    if not isinstance(entry, dict):
+                        continue
+                    start = entry.get("start_row")
+                    end = entry.get("end_row")
+                    json_path = entry.get("json")
+                    if not isinstance(start, int) or not isinstance(end, int):
+                        continue
+                    if not isinstance(json_path, str) or not json_path.strip():
+                        continue
+                    normalized = Path(json_path).as_posix()
+                    if normalized.startswith("./"):
+                        normalized = normalized[2:]
+                    normalized_entry = {
+                        "start_row": start,
+                        "end_row": end,
+                        "json": normalized,
+                    }
+                    row_count = entry.get("row_count")
+                    if isinstance(row_count, int) and row_count >= 0:
+                        normalized_entry["row_count"] = row_count
+                    volume_chunks.append(normalized_entry)
+                loaded_from_manifest = bool(volume_chunks)
+
+    if not loaded_from_manifest:
+        for file_path in sorted(vol_dir.glob("epstein_ranked_*.jsonl")):
+            match = chunk_pattern.match(file_path.name)
+            if not match:
+                continue
+            start = int(match.group(1))
+            end = int(match.group(2))
+            normalized = file_path.as_posix()
+            if normalized.startswith("./"):
+                normalized = normalized[2:]
+            volume_chunks.append({"start_row": start, "end_row": end, "json": normalized})
+
+    if volume_rows_processed is None:
+        volume_rows_processed = 0
+        for entry in volume_chunks:
+            row_count = entry.get("row_count")
+            if not isinstance(row_count, int) or row_count < 0:
+                try:
+                    with Path(entry["json"]).open("r", encoding="utf-8") as handle:
+                        row_count = sum(1 for _ in handle)
+                except OSError:
+                    row_count = 0
+                entry["row_count"] = row_count
+            volume_rows_processed += row_count
+
+    chunks.extend(volume_chunks)
+    rows_processed += volume_rows_processed
 
 manifest = {
     "metadata": {

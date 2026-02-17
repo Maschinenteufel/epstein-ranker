@@ -2,6 +2,7 @@ import argparse
 import csv
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -359,7 +360,7 @@ class GptRankerHelpersTest(unittest.TestCase):
         self.assertEqual(args.chunk_dir, Path("/tmp/chunks"))
         self.assertEqual(args.known_json, ["keep.jsonl"])
 
-    def test_load_resume_completed_ids_ignores_checkpoint_without_outputs(self) -> None:
+    def test_load_resume_completed_ids_uses_checkpoint_without_output_validation(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             checkpoint = root / ".checkpoint"
@@ -373,9 +374,9 @@ class GptRankerHelpersTest(unittest.TestCase):
                 chunk_dir=root / "chunks",
             )
             completed = gpt_ranker.load_resume_completed_ids(args)
-        self.assertEqual(completed, set())
+        self.assertEqual(completed, {"IMAGES/0001/EFTA00000001.pdf"})
 
-    def test_load_resume_completed_ids_uses_chunk_outputs(self) -> None:
+    def test_load_resume_completed_ids_bootstraps_from_chunk_outputs_when_checkpoint_empty(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             chunk_dir = root / "chunks"
@@ -386,7 +387,7 @@ class GptRankerHelpersTest(unittest.TestCase):
                 encoding="utf-8",
             )
             checkpoint = root / ".checkpoint"
-            checkpoint.write_text("STALE_ROW_ID\n", encoding="utf-8")
+            checkpoint.write_text("", encoding="utf-8")
             args = argparse.Namespace(
                 resume=True,
                 checkpoint=checkpoint,
@@ -396,7 +397,38 @@ class GptRankerHelpersTest(unittest.TestCase):
                 chunk_dir=chunk_dir,
             )
             completed = gpt_ranker.load_resume_completed_ids(args)
-        self.assertEqual(completed, {"IMAGES/0001/EFTA00000001.pdf"})
+            self.assertEqual(completed, {"IMAGES/0001/EFTA00000001.pdf"})
+            self.assertIn(
+                "IMAGES/0001/EFTA00000001.pdf",
+                checkpoint.read_text(encoding="utf-8"),
+            )
+
+    def test_pdf_page_count_cache_persists_between_instances(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            cache_path = root / ".pdf_page_counts.json"
+            pdf_path = root / "doc.pdf"
+            pdf_path.write_bytes(b"%PDF-1.4\n")
+
+            cache = gpt_ranker.PdfPageCountCache(cache_path)
+            with mock.patch.object(gpt_ranker, "detect_pdf_page_count", return_value=12) as mocked_detect:
+                first = cache.get_page_count(pdf_path)
+                cache.flush()
+            self.assertEqual(first, 12)
+            self.assertEqual(mocked_detect.call_count, 1)
+
+            cache_reloaded = gpt_ranker.PdfPageCountCache(cache_path)
+            with mock.patch.object(gpt_ranker, "detect_pdf_page_count", return_value=99) as mocked_detect_reloaded:
+                second = cache_reloaded.get_page_count(pdf_path)
+            self.assertEqual(second, 12)
+            self.assertEqual(mocked_detect_reloaded.call_count, 0)
+
+            time.sleep(0.001)
+            pdf_path.write_bytes(b"%PDF-1.4\nupdated")
+            with mock.patch.object(gpt_ranker, "detect_pdf_page_count", return_value=13) as mocked_detect_changed:
+                third = cache_reloaded.get_page_count(pdf_path)
+            self.assertEqual(third, 13)
+            self.assertEqual(mocked_detect_changed.call_count, 1)
 
     def test_write_run_metadata_writes_profile(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
